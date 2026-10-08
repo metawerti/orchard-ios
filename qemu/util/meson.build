@@ -8,6 +8,9 @@ if host_os != 'windows'
   endif
   util_ss.add(files('compatfd.c'))
   util_ss.add(files('event_notifier-posix.c'))
+  if host_machine.subsystem() == 'ios'
+    util_ss.add(files('pipe2-ios.c'))
+  endif
   if host_os != 'emscripten'
     util_ss.add(files('mmap-alloc.c'))
   endif
