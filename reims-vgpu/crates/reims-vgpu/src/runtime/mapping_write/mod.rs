@@ -360,6 +360,16 @@ fn vouch_for_write<M: HostMemory + HostOps>(
                 "no_pages" => "mapw_unwit_no_pages",
                 _ => "mapw_unwit_no_mapping",
             });
+
+            let generation = state
+                .mappings
+                .get(&mapping_id)
+                .map(|m| m.map_generation)
+                .unwrap_or(0);
+
+            crate::observe::fail(format!(
+                "mapw_unwitnessed writer={writer} mid={mapping_id} why={why} gen={generation}"
+            ));
         }
         mapper::PagesVerdict::Drifted => {
             crate::observe::fail(format!(
