@@ -83,7 +83,7 @@ if [ ! -f "$IOS/build.ninja" ]; then
 fi
 
 echo "==> ninja -j$JOBS"
-"${NINJA:-ninja}" -C "$IOS" -j"$JOBS"
+"${NINJA:-ninja}" -C "$IOS" -j"$JOBS" libqemu-aarch64-softmmu.dylib
 
 lib="$IOS/libqemu-aarch64-softmmu.dylib"
 echo
