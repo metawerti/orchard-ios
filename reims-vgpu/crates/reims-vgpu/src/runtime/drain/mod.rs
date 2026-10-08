@@ -6184,6 +6184,34 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         CHILD_OP_ONLINE_ACK => {
             state.display.online_acked = true;
+
+            // DEBUG: one-shot Ventura VBL bootstrap experiment.
+            let gpa = state.display.shared_gpa;
+            if gpa != 0 {
+                let mut mask_le = [0u8; 4];
+                if host
+                    .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
+                    .is_ok()
+                {
+                    let before = ld32(&mask_le);
+                    if before == 0x0c {
+                        let after = before | DISPLAY_VBL_EVENT_MASK;
+                        shared_w32(
+                            host,
+                            gpa,
+                            DISPLAY_SHARED_ENABLE_MASK,
+                            after,
+                            state.page_size() as usize,
+                        );
+                        crate::observe::fail(format!(
+                            "debug_vbl_bootstrap index={} mask_before={:#x} mask_after={:#x}",
+                            state.display.display_index,
+                            before,
+                            after
+                        ));
+                    }
+                }
+            }
             // The connectionChange-ack (process_online opcode 2) is believed to
             // echo the shared-descriptor `+0x200` token back to the host in its
             // payload. We consume the ack (online_acked)
