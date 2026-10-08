@@ -45,5 +45,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Orchard-MacPad-Debug
-          path: ios/Orchard.ipa
+          path: ios/app/Orchard.ipa
           if-no-files-found: error
