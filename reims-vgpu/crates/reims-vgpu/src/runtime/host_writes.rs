@@ -194,6 +194,16 @@ impl Default for EpochChunk {
     }
 }
 
+/// DEBUG: mapping provenance for a page-exact host write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteAttribution {
+    pub mapping_id: u32,
+    pub map_generation: u32,
+    pub has_backing_walk: bool,
+    pub has_mapping_internal: bool,
+    pub has_page_table_kva: bool,
+}
+
 /// A write this device recorded against a page the guest had taken back.
 ///
 /// Both epochs travel with it: `released_at` is the write census epoch current
@@ -209,6 +219,8 @@ pub struct ReleasedWrite {
     pub released_at: u64,
     /// Write census epoch of the write that landed on it afterwards.
     pub wrote_at: u64,
+    /// Mapping provenance when this write came through a known mapping.
+    pub attribution: Option<WriteAttribution>,
 }
 
 /// How many findings the report queue holds between drains.
@@ -227,6 +239,7 @@ struct HitSink<'a> {
     armed: &'a mut u64,
     hits: &'a mut Vec<ReleasedWrite>,
     hits_dropped: &'a mut u64,
+    attribution: Option<WriteAttribution>,
     page_shift: u32,
 }
 
@@ -252,6 +265,7 @@ impl HitSink<'_> {
                     gpa: page << self.page_shift,
                     released_at,
                     wrote_at: at,
+                    attribution: self.attribution,
                 });
             } else {
                 *self.hits_dropped += 1;
@@ -273,6 +287,7 @@ impl PageEpochs {
             armed,
             hits,
             hits_dropped,
+            attribution: None,
             page_shift,
         };
         while count != 0 {
@@ -340,7 +355,13 @@ impl PageEpochs {
         }
     }
 
-    fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32)
+    fn note_pages<I>(
+        &mut self,
+        pages: I,
+        epoch: u64,
+        page_shift: u32,
+        attribution: Option<WriteAttribution>,
+    )
     where
         I: IntoIterator<Item = u64>,
     {
@@ -355,6 +376,7 @@ impl PageEpochs {
             armed,
             hits,
             hits_dropped,
+            attribution,
             page_shift,
         };
         let mut pages = pages.into_iter().peekable();
@@ -482,7 +504,7 @@ impl HostWrites {
         match pages {
             Some(p) => self
                 .pages
-                .note_pages(p.iter().copied(), self.epoch, self.page_shift),
+                .note_pages(p.iter().copied(), self.epoch, self.page_shift, None),
             None => self.pages.note_unknown(self.epoch),
         }
     }
@@ -490,18 +512,20 @@ impl HostWrites {
     /// Record a write covering exactly `pages` (page-aligned guest addresses).
     pub fn note_pages(&mut self, pages: Vec<u64>) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages
+            .note_pages(pages, self.epoch, self.page_shift, None);
     }
 
     /// Record an already-resolved page iterator without materializing a second
     /// allocation. The caller retains ownership of the allocation identity;
     /// this type owns only its page-exact epochs.
-    pub fn note_page_iter<I>(&mut self, pages: I)
+    pub fn note_page_iter<I>(&mut self, pages: I, attribution: WriteAttribution)
     where
         I: IntoIterator<Item = u64>,
     {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages
+            .note_pages(pages, self.epoch, self.page_shift, Some(attribution));
     }
 
     /// Record the exact page runs retained with an admitted guest allocation.

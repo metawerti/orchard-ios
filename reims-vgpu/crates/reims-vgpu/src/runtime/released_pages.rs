@@ -90,15 +90,34 @@ pub fn sweep(state: &mut crate::model::DeviceState) {
         if !crate::observe::first_sight("released_write_after_release", hit.gpa) {
             continue;
         }
+        let (attributed, mid, generation, walk, internal, table) = match hit.attribution {
+            Some(a) => (
+                1u8,
+                a.mapping_id,
+                a.map_generation,
+                a.has_backing_walk as u8,
+                a.has_mapping_internal as u8,
+                a.has_page_table_kva as u8,
+            ),
+            None => (0, 0, 0, 0, 0, 0),
+        };
+
         crate::observe::fail(format!(
             "released_pages reason=released_write_after_release gpa={:#x} \
-             released_at={} wrote_at={} armed={} (this device wrote to a guest page after the \
+             released_at={} wrote_at={} armed={} attributed={} mid={} gen={} \
+             walk={} internal={} table={} (this device wrote to a guest page after the \
              guest released it; the guest is entitled to have given that page to something \
              else, including its own page table)",
             hit.gpa,
             hit.released_at,
             hit.wrote_at,
             writes.armed_pages(),
+            attributed,
+            mid,
+            generation,
+            walk,
+            internal,
+            table,
         ));
     }
 }

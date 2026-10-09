@@ -5693,11 +5693,22 @@ impl DeviceState {
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
-        let Some(entries) = self
+        let Some((entries, attribution)) = self
             .mappings
             .get(&mapping_id)
-            .map(|mapping| mapping.page_entries.as_slice())
-            .filter(|entries| !entries.is_empty())
+            .map(|mapping| {
+                (
+                    mapping.page_entries.as_slice(),
+                    crate::runtime::host_writes::WriteAttribution {
+                        mapping_id,
+                        map_generation: mapping.map_generation,
+                        has_backing_walk: mapping.backing_walk.is_some(),
+                        has_mapping_internal: mapping.mapping_internal != 0,
+                        has_page_table_kva: mapping.page_table_kva != 0,
+                    },
+                )
+            })
+            .filter(|(entries, _)| !entries.is_empty())
         else {
             self.host_writes.note_unknown();
             return;
@@ -5713,11 +5724,13 @@ impl DeviceState {
             self.host_writes.note_unknown();
             return;
         }
-        self.host_writes
-            .note_page_iter(entries.iter().map(|&entry| {
+        self.host_writes.note_page_iter(
+            entries.iter().map(|&entry| {
                 crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift)
                     .expect("page entries were validated above")
-            }));
+            }),
+            attribution,
+        );
     }
 
     /// Issue a sampled-content generation that has never been issued before.
