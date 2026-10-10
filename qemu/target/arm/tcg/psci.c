@@ -17,6 +17,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "cpu.h"
 #include "helper.h"
 #include "kvm-consts.h"
@@ -120,6 +121,15 @@ void arm_handle_psci_call(ARMCPU *cpu)
         }
         break;
     case QEMU_PSCI_0_2_FN_SYSTEM_RESET:
+        error_report(
+            "MACPAD_RESET_TRACE stage=psci_system_reset "
+            "cpu=%d pc=0x%" PRIx64 " el=%d "
+            "x0=0x%" PRIx64 " x1=0x%" PRIx64
+            " x2=0x%" PRIx64 " x3=0x%" PRIx64,
+            CPU(cpu)->cpu_index,
+            env->pc,
+            arm_current_el(env),
+            param[0], param[1], param[2], param[3]);
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI
          * mandates that we never return from the reset/shutdown

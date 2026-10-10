@@ -890,6 +890,13 @@ void qemu_system_guest_pvshutdown(void)
 
 void qemu_system_reset_request(ShutdownCause reason)
 {
+    error_report(
+        "MACPAD_RESET_TRACE stage=qemu_reset_request "
+        "reason=%d guest_reset=%d host_qmp_reset=%d subsystem_reset=%d",
+        reason,
+        reason == SHUTDOWN_CAUSE_GUEST_RESET,
+        reason == SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET,
+        reason == SHUTDOWN_CAUSE_SUBSYSTEM_RESET);
     if (reboot_action == REBOOT_ACTION_SHUTDOWN &&
         reason != SHUTDOWN_CAUSE_SUBSYSTEM_RESET) {
         shutdown_requested = reason;
