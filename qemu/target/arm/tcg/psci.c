@@ -121,15 +121,62 @@ void arm_handle_psci_call(ARMCPU *cpu)
         }
         break;
     case QEMU_PSCI_0_2_FN_SYSTEM_RESET:
+    {
+        uint64_t fp = env->xregs[29];
+        uint64_t lr = env->xregs[30];
+        uint64_t sp = env->xregs[31];
+        uint64_t frame0[2] = { 0, 0 };
+        uint64_t frame1[2] = { 0, 0 };
+        int frame0_ok = 0;
+        int frame1_ok = 0;
+
+        /*
+         * DEBUG: Capture a small best-effort AArch64 frame chain at the
+         * instant the guest requests PSCI SYSTEM_RESET.
+         *
+         * Do not modify or canonicalize/PAC-strip guest addresses here.
+         * Raw values are more useful for post-run comparison.
+         */
+        if (is_a64(env) &&
+            fp != 0 &&
+            (fp & 0xf) == 0 &&
+            fp >= sp &&
+            fp - sp <= (1ULL << 20)) {
+
+            frame0_ok = cpu_memory_rw_debug(
+                CPU(cpu), fp, frame0, sizeof(frame0), false) == 0;
+
+            if (frame0_ok &&
+                frame0[0] != 0 &&
+                (frame0[0] & 0xf) == 0 &&
+                frame0[0] >= fp &&
+                frame0[0] - fp <= (1ULL << 20)) {
+
+                frame1_ok = cpu_memory_rw_debug(
+                    CPU(cpu), frame0[0],
+                    frame1, sizeof(frame1), false) == 0;
+            }
+        }
+
         error_report(
             "MACPAD_RESET_TRACE stage=psci_system_reset "
-            "cpu=%d pc=0x%" PRIx64 " el=%d "
+            "cpu=%d pc=0x%" PRIx64 " smc_pc=0x%" PRIx64 " el=%d "
+            "sp=0x%" PRIx64 " fp=0x%" PRIx64 " lr=0x%" PRIx64 " "
+            "frame0_ok=%d frame0_fp=0x%" PRIx64
+            " frame0_lr=0x%" PRIx64 " "
+            "frame1_ok=%d frame1_fp=0x%" PRIx64
+            " frame1_lr=0x%" PRIx64 " "
             "x0=0x%" PRIx64 " x1=0x%" PRIx64
             " x2=0x%" PRIx64 " x3=0x%" PRIx64,
             CPU(cpu)->cpu_index,
             env->pc,
+            env->pc - 4,
             arm_current_el(env),
+            sp, fp, lr,
+            frame0_ok, frame0[0], frame0[1],
+            frame1_ok, frame1[0], frame1[1],
             param[0], param[1], param[2], param[3]);
+
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI
          * mandates that we never return from the reset/shutdown
@@ -137,6 +184,7 @@ void arm_handle_psci_call(ARMCPU *cpu)
          * anything further.
          */
         goto cpu_off;
+    }
     case QEMU_PSCI_0_2_FN_SYSTEM_OFF:
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         goto cpu_off;
