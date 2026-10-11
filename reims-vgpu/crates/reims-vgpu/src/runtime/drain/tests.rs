@@ -311,6 +311,28 @@ fn display_descriptor_advertises_four_modes_incl_4k() {
 }
 
 #[test]
+fn display_descriptor_increments_configuration_generation() {
+    let mut host = FakeHost::new();
+    let gpa = 0x7a100000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+
+    let read_generation = |host: &mut FakeHost| {
+        let mut b = [0u8; 4];
+        host.read_gpa(gpa + DISPLAY_DESC_CONFIG_GENERATION, &mut b)
+            .unwrap();
+        u32::from_le_bytes(b)
+    };
+
+    assert_eq!(read_generation(&mut host), 0);
+
+    fill_display_descriptor(&mut host, gpa, 0, PAGE_SIZE_ARM64E);
+    assert_eq!(read_generation(&mut host), 1);
+
+    fill_display_descriptor(&mut host, gpa, 0, PAGE_SIZE_ARM64E);
+    assert_eq!(read_generation(&mut host), 2);
+}
+
+#[test]
 fn present_page_identity_reports_alias_and_disjoint_peers() {
     use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);

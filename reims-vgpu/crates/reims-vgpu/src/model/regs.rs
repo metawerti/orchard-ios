@@ -857,6 +857,13 @@ pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
 /// the instrument that settles it is the guest's own EDID, decoded on a boot of a
 /// guest new enough to read the block.
 pub const DISPLAY_DESC_FEATURES: u64 = 0x1c;
+
+/// Configuration generation published with the display descriptor.
+///
+/// The reference host increments this u32 after every descriptor refill. The
+/// guest echoes the value as word 1 of CHILD_OP_ONLINE_ACK, beside the pipe
+/// index, so the host can tell which descriptor generation was acknowledged.
+pub const DISPLAY_DESC_CONFIG_GENERATION: u64 = 0x200;
 /// Timing-element **count** (not a pixel width — large values hang the guest).
 ///
 /// Each element is width `u16`, height `u16`, refresh as 16.16 fixed `u32`, and then

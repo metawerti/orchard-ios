@@ -4290,6 +4290,12 @@ fn shared_w32<H: HostMemory + HostOps>(host: &mut H, gpa: u64, off: u64, v: u32,
     let _ = gpa_map::write_bytes(host, gpa + off, &b, page_size);
 }
 
+fn shared_r32<M: HostMemory>(host: &M, gpa: u64, off: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    host.read_gpa(gpa + off, &mut b).ok()?;
+    Some(ld32(&b))
+}
+
 /// Fill the guest display descriptor page (archive `apple_pv_gpu_display_setup`).
 ///
 ///: `+0x208` is the timing-element **count**, not a
@@ -4409,6 +4415,30 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
             return;
         }
         let _ = gpa_map::write_bytes(host, gpa + off, &encoded, psz);
+    }
+
+    // The reference host increments the descriptor configuration generation
+    // after every refill. The guest echoes this value in word 1 of ONLINE_ACK,
+    // beside the pipe index, so each published descriptor has an identity.
+    match shared_r32(host, gpa, DISPLAY_DESC_CONFIG_GENERATION) {
+        Some(before) => {
+            let after = before.wrapping_add(1);
+            shared_w32(
+                host,
+                gpa,
+                DISPLAY_DESC_CONFIG_GENERATION,
+                after,
+                psz,
+            );
+            crate::observe::fail(format!(
+                "display_descriptor_generation index={index} before={before:#x} after={after:#x}"
+            ));
+        }
+        None => {
+            crate::observe::fail(format!(
+                "display_descriptor_generation_read_failed index={index}"
+            ));
+        }
     }
 }
 
@@ -6212,12 +6242,11 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     }
                 }
             }
-            // The connectionChange-ack (process_online opcode 2) is believed to
-            // echo the shared-descriptor `+0x200` token back to the host in its
-            // payload. We consume the ack (online_acked)
-            // but never inspect that token — capture it here (raw first words +
-            // len, rare/once-per-online so no flood) so a bad boot records what
-            // value the guest round-tripped. Measure-only.
+            // The connectionChange ack (process_online opcode 2) echoes the
+            // shared-descriptor configuration generation (+0x200) as word 1,
+            // beside the pipe index in word 0. Keep accepting the ack exactly
+            // as before, but record whether the guest acknowledged the generation
+            // currently published by this device. Measure-only.
             let w0 = if packet.payload.len() >= 4 {
                 ld32(&packet.payload[0..])
             } else {
@@ -6228,12 +6257,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
             } else {
                 0
             };
+            let published_generation =
+                shared_r32(host, gpa, DISPLAY_DESC_CONFIG_GENERATION);
             crate::observe::fail(format!(
-                "display_online_ack index={} plen={} w0={:#x} w1={:#x}",
+                "display_online_ack index={} plen={} w0={:#x} w1={:#x} published_generation={} generation_match={}",
                 state.display.display_index,
                 packet.payload.len(),
                 w0,
-                w1
+                w1,
+                published_generation
+                    .map(|v| format!("{v:#x}"))
+                    .unwrap_or_else(|| "read_failed".to_string()),
+                published_generation.map(|v| v == w1).unwrap_or(false)
             ));
         }
         /*
