@@ -826,19 +826,23 @@ fn apply_delete_task<H: HostMemory + HostOps>(
 
     crate::observe::off(format!(
         concat!(
-            "pre_delete_task site={} task={task_id} plen={} ",
+            "pre_delete_task site={} task={} plen={} ",
             "display_gpa={:#x} display_index={} online_acked={} ",
-            "online_tries={} poll_ctr={} pending={pending:?} ",
-            "enable_mask={enable_mask:?} generation={generation:?} ",
-            "timing_count={timing_count:?}"
+            "online_tries={} poll_ctr={} pending={:?} ",
+            "enable_mask={:?} generation={:?} timing_count={:?}"
         ),
         packet_site(channel),
+        task_id,
         payload.len(),
         display_gpa,
         state.display.display_index,
         state.display.online_acked as u8,
         state.display.online_tries,
         state.display.poll_ctr,
+        pending,
+        enable_mask,
+        generation,
+        timing_count,
     ));
 
     // The task's GVA space goes with it, so every bind resolution keyed on it
