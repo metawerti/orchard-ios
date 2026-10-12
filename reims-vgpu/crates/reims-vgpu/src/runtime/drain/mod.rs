@@ -825,11 +825,13 @@ fn apply_delete_task<H: HostMemory + HostOps>(
     };
 
     crate::observe::off(format!(
-        "pre_delete_task site={} task={task_id} plen={} "
-            "display_gpa={:#x} display_index={} online_acked={} "
-            "online_tries={} poll_ctr={} pending={pending:?} "
-            "enable_mask={enable_mask:?} generation={generation:?} "
-            "timing_count={timing_count:?}",
+        concat!(
+            "pre_delete_task site={} task={task_id} plen={} ",
+            "display_gpa={:#x} display_index={} online_acked={} ",
+            "online_tries={} poll_ctr={} pending={pending:?} ",
+            "enable_mask={enable_mask:?} generation={generation:?} ",
+            "timing_count={timing_count:?}"
+        ),
         packet_site(channel),
         payload.len(),
         display_gpa,
