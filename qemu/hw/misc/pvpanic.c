@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/error-report.h"
 #include "system/runstate.h"
 
 #include "hw/nvram/fw_cfg.h"
@@ -52,12 +53,36 @@ static void handle_event(int event)
 static uint64_t pvpanic_read(void *opaque, hwaddr addr, unsigned size)
 {
     PVPanicState *pvp = opaque;
+    static bool macpad_capability_logged;
+
+    if (!macpad_capability_logged) {
+        error_report(
+            "MACPAD_PVPANIC_CAP supported=0x%x "
+            "panicked=%d crash_loaded=%d shutdown=%d",
+            pvp->events,
+            !!(pvp->events & PVPANIC_PANICKED),
+            !!(pvp->events & PVPANIC_CRASH_LOADED),
+            !!(pvp->events & PVPANIC_SHUTDOWN));
+        macpad_capability_logged = true;
+    }
+
     return pvp->events;
 }
 
 static void pvpanic_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
+    PVPanicState *pvp = opaque;
+
+    error_report(
+        "MACPAD_PVPANIC_EVENT value=0x%" PRIx64 " supported=0x%x "
+        "panicked=%d crash_loaded=%d shutdown=%d",
+        val,
+        pvp->events,
+        !!(val & PVPANIC_PANICKED),
+        !!(val & PVPANIC_CRASH_LOADED),
+        !!(val & PVPANIC_SHUTDOWN));
+
     handle_event(val);
 }
 

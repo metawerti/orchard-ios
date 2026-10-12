@@ -789,7 +789,12 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
 }
 
-fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
+fn apply_delete_task<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    payload: &[u8],
+    channel: Option<u32>,
+) {
     // A payload too short to hold an id used to default to `0`, which is the
     // **kernel task** — so a truncated delete retired the resolutions of the
     // one slot whose teardown costs the most, and did it silently.
@@ -800,6 +805,40 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
             return;
         }
     };
+
+    /*
+     * DEBUG IPA7: Snapshot display state at the earliest trustworthy
+     * DeleteTask boundary: decode has succeeded, but no task/GVA/buffer state
+     * has been retired yet. Log every valid delete; post-run analysis decides
+     * which one is T0 for the shutdown cluster.
+     */
+    let display_gpa = state.display.shared_gpa;
+    let (pending, enable_mask, generation, timing_count) = if display_gpa != 0 {
+        (
+            shared_r32(host, display_gpa, DISPLAY_SHARED_PENDING),
+            shared_r32(host, display_gpa, DISPLAY_SHARED_ENABLE_MASK),
+            shared_r32(host, display_gpa, DISPLAY_DESC_CONFIG_GENERATION),
+            shared_r32(host, display_gpa, DISPLAY_DESC_TIMING_COUNT),
+        )
+    } else {
+        (None, None, None, None)
+    };
+
+    crate::observe::off(format!(
+        "pre_delete_task site={} task={task_id} plen={} "
+            "display_gpa={:#x} display_index={} online_acked={} "
+            "online_tries={} poll_ctr={} pending={pending:?} "
+            "enable_mask={enable_mask:?} generation={generation:?} "
+            "timing_count={timing_count:?}",
+        packet_site(channel),
+        payload.len(),
+        display_gpa,
+        state.display.display_index,
+        state.display.online_acked as u8,
+        state.display.online_tries,
+        state.display.poll_ctr,
+    ));
+
     // The task's GVA space goes with it, so every bind resolution keyed on it
     // names bytes that are no longer this task's. Here rather than at the two
     // call sites: the root and child FIFOs both reach this, and a rule written
@@ -4098,7 +4137,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
         }
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, None),
         ROOT_OP_SET_OBJECT_LIST => apply_set_object_list(state, &packet.payload, None),
-        ROOT_OP_DELETE_TASK => apply_delete_task(state, &packet.payload, None),
+        ROOT_OP_DELETE_TASK => apply_delete_task(state, host, &packet.payload, None),
         // One command in one flat opcode space, not a wrapper. See
         // `ROOT_OP_SETUP_SHARED_STATE` for what this arm used to do with the
         // payload's first word, and why nothing here ever caught it.
@@ -6207,7 +6246,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         // PVG CmdDeleteTask (0x20) on child channels too (was SMALL_ID alias only in decode).
         CHILD_OP_DELETE_TASK => {
-            apply_delete_task(state, &packet.payload, Some(channel_id));
+            apply_delete_task(state, host, &packet.payload, Some(channel_id));
         }
         CHILD_OP_SETUP_SHARED_STATE => {
             apply_setup_shared_state(state, host, &packet.payload, Some(channel_id));

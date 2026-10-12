@@ -125,36 +125,63 @@ void arm_handle_psci_call(ARMCPU *cpu)
         uint64_t fp = env->xregs[29];
         uint64_t lr = env->xregs[30];
         uint64_t sp = env->xregs[31];
-        uint64_t frame0[2] = { 0, 0 };
-        uint64_t frame1[2] = { 0, 0 };
-        int frame0_ok = 0;
-        int frame1_ok = 0;
+        uint64_t frame_at[12] = { 0 };
+        uint64_t frame_next[12] = { 0 };
+        uint64_t frame_lr[12] = { 0 };
+        int frame_count = 0;
+        const char *frame_stop = "initial_invalid";
 
         /*
-         * DEBUG: Capture a small best-effort AArch64 frame chain at the
+         * DEBUG: Capture a bounded best-effort AArch64 frame chain at the
          * instant the guest requests PSCI SYSTEM_RESET.
          *
          * Do not modify or canonicalize/PAC-strip guest addresses here.
          * Raw values are more useful for post-run comparison.
+         *
+         * Stop rather than guess if the chain becomes unreadable, unaligned,
+         * non-increasing, or makes an implausibly large jump. This is an
+         * observer only; it must never change reset behaviour.
          */
         if (is_a64(env) &&
             fp != 0 &&
             (fp & 0xf) == 0 &&
             fp >= sp &&
             fp - sp <= (1ULL << 20)) {
+            uint64_t walk_fp = fp;
 
-            frame0_ok = cpu_memory_rw_debug(
-                CPU(cpu), fp, frame0, sizeof(frame0), false) == 0;
+            frame_stop = "max_frames";
+            for (int i = 0; i < 12; i++) {
+                uint64_t pair[2] = { 0, 0 };
 
-            if (frame0_ok &&
-                frame0[0] != 0 &&
-                (frame0[0] & 0xf) == 0 &&
-                frame0[0] >= fp &&
-                frame0[0] - fp <= (1ULL << 20)) {
+                if (cpu_memory_rw_debug(
+                        CPU(cpu), walk_fp, pair, sizeof(pair), false) != 0) {
+                    frame_stop = "read_fail";
+                    break;
+                }
 
-                frame1_ok = cpu_memory_rw_debug(
-                    CPU(cpu), frame0[0],
-                    frame1, sizeof(frame1), false) == 0;
+                frame_at[i] = walk_fp;
+                frame_next[i] = pair[0];
+                frame_lr[i] = pair[1];
+                frame_count++;
+
+                if (pair[0] == 0) {
+                    frame_stop = "zero";
+                    break;
+                }
+                if ((pair[0] & 0xf) != 0) {
+                    frame_stop = "unaligned";
+                    break;
+                }
+                if (pair[0] <= walk_fp) {
+                    frame_stop = "non_increasing";
+                    break;
+                }
+                if (pair[0] - walk_fp > (1ULL << 20)) {
+                    frame_stop = "jump_limit";
+                    break;
+                }
+
+                walk_fp = pair[0];
             }
         }
 
@@ -162,10 +189,7 @@ void arm_handle_psci_call(ARMCPU *cpu)
             "MACPAD_RESET_TRACE stage=psci_system_reset "
             "cpu=%d pc=0x%" PRIx64 " smc_pc=0x%" PRIx64 " el=%d "
             "sp=0x%" PRIx64 " fp=0x%" PRIx64 " lr=0x%" PRIx64 " "
-            "frame0_ok=%d frame0_fp=0x%" PRIx64
-            " frame0_lr=0x%" PRIx64 " "
-            "frame1_ok=%d frame1_fp=0x%" PRIx64
-            " frame1_lr=0x%" PRIx64 " "
+            "frame_count=%d frame_stop=%s "
             "x0=0x%" PRIx64 " x1=0x%" PRIx64
             " x2=0x%" PRIx64 " x3=0x%" PRIx64,
             CPU(cpu)->cpu_index,
@@ -173,9 +197,15 @@ void arm_handle_psci_call(ARMCPU *cpu)
             env->pc - 4,
             arm_current_el(env),
             sp, fp, lr,
-            frame0_ok, frame0[0], frame0[1],
-            frame1_ok, frame1[0], frame1[1],
+            frame_count, frame_stop,
             param[0], param[1], param[2], param[3]);
+
+        for (int i = 0; i < frame_count; i++) {
+            error_report(
+                "MACPAD_RESET_FRAME index=%d at_fp=0x%" PRIx64
+                " next_fp=0x%" PRIx64 " lr=0x%" PRIx64,
+                i, frame_at[i], frame_next[i], frame_lr[i]);
+        }
 
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI
