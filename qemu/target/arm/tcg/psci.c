@@ -207,6 +207,47 @@ void arm_handle_psci_call(ARMCPU *cpu)
                 i, frame_at[i], frame_next[i], frame_lr[i]);
         }
 
+
+        /*
+         * MACPAD: Read-only executable fingerprints at the final guest reset.
+         * One HVC site plus the saved frame return addresses.
+         * This runs only after the guest has requested SYSTEM_RESET.
+         */
+        for (int probe_index = -1;
+             probe_index < frame_count;
+             probe_index++) {
+            uint64_t probe = probe_index < 0
+                ? env->pc - 4
+                : frame_lr[probe_index];
+            uint32_t words[8] = { 0 };
+            int rc = -1;
+
+            if (probe >= 16 && (probe & 3) == 0) {
+                rc = cpu_memory_rw_debug(
+                    CPU(cpu), probe - 16,
+                    words, sizeof(words), false);
+            }
+
+            if (rc != 0) {
+                error_report(
+                    "MACPAD_RESET_CODE index=%d addr=0x%" PRIx64
+                    " read_fail=%d",
+                    probe_index, probe, rc);
+                continue;
+            }
+
+            error_report(
+                "MACPAD_RESET_CODE index=%d addr=0x%" PRIx64
+                " window_start=0x%" PRIx64
+                " words=%08" PRIx32 " %08" PRIx32
+                " %08" PRIx32 " %08" PRIx32
+                " %08" PRIx32 " %08" PRIx32
+                " %08" PRIx32 " %08" PRIx32,
+                probe_index, probe, probe - 16,
+                words[0], words[1], words[2], words[3],
+                words[4], words[5], words[6], words[7]);
+        }
+
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI
          * mandates that we never return from the reset/shutdown
