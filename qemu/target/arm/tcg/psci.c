@@ -18,6 +18,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/atomic.h"
+#include "qemu/bswap.h"
+#include "exec/cputlb.h"
 #include "cpu.h"
 #include "helper.h"
 #include "kvm-consts.h"
@@ -27,6 +30,266 @@
 #include "arm-powerctl.h"
 #include "target/arm/multiprocessing.h"
 #include "target/arm/trace.h"
+
+#define MACPAD_CAL_MAX_FRAMES 12
+#define MACPAD_CAL_MAX_RESETS 8U
+#define MACPAD_CAL_ENTRY_WORDS 48
+
+static bool macpad_cal_add_signed(uint64_t base, int64_t delta,
+                                  uint64_t *result)
+{
+    if (delta < 0) {
+        uint64_t magnitude = (uint64_t)(-(delta + 1)) + 1;
+
+        if (base < magnitude) {
+            return false;
+        }
+        *result = base - magnitude;
+    } else {
+        uint64_t magnitude = (uint64_t)delta;
+
+        if (base > UINT64_MAX - magnitude) {
+            return false;
+        }
+        *result = base + magnitude;
+    }
+    return true;
+}
+
+/* A different caller layout is a calibration miss, not permission to guess. */
+static const char *macpad_cal_halt_site(CPUState *cs, uint64_t raw_lr,
+                                      uint32_t words[16])
+{
+    static const uint32_t expected[16] = {
+        0xd503237f, 0xa9be4ff4, 0xa9017bfd, 0x910043fd,
+        0x7100001f, 0x1a9f07f3, 0xf0ff9b28, 0x91128508,
+        0xf0ff9b29, 0x9112b929, 0x9a880120, 0x97fbd329,
+        0xaa1303e0, 0x52800001, 0x9415c857, 0x14000000,
+    };
+    static const uint32_t masks[16] = {
+        0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+        0xffffffff, 0xffffffff, 0x9f00001f, 0xffc003ff,
+        0x9f00001f, 0xffc003ff, 0xffffffff, 0xfc000000,
+        0xffffffff, 0xffffffff, 0xfc000000, 0xffffffff,
+    };
+    static const char messages[2][13] = {
+        "MACH Reboot\n", "CPU halted\n",
+    };
+    static const size_t message_lengths[2] = {
+        sizeof("MACH Reboot\n"), sizeof("CPU halted\n"),
+    };
+    uint8_t raw[64];
+    uint64_t start;
+    const char *error;
+
+    if ((raw_lr & 3) || raw_lr < 0x3c || raw_lr > UINT64_MAX - 4) {
+        return "raw_lr_invalid";
+    }
+    start = raw_lr - 0x3c;
+    error = tcg_debug_read_cached_ram(cs, start, raw, sizeof(raw), true);
+    if (error) {
+        return error;
+    }
+    for (unsigned int i = 0; i < 16; i++) {
+        words[i] = ldl_le_p(raw + i * 4);
+        if ((words[i] & masks[i]) != (expected[i] & masks[i])) {
+            return "signature_mismatch";
+        }
+    }
+    for (unsigned int message = 0; message < 2; message++) {
+        unsigned int adrp_index = message ? 8 : 6;
+        uint32_t adrp = words[adrp_index];
+        uint32_t add = words[adrp_index + 1];
+        uint64_t adrp_pc = start + adrp_index * 4;
+        uint64_t string_addr;
+        int64_t imm21;
+        char actual[13];
+
+        imm21 = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3);
+        if (imm21 & (INT64_C(1) << 20)) {
+            imm21 -= INT64_C(1) << 21;
+        }
+        if (!macpad_cal_add_signed(adrp_pc & ~UINT64_C(0xfff),
+                                   imm21 * 4096, &string_addr) ||
+            !macpad_cal_add_signed(string_addr, (add >> 10) & 0xfff,
+                                   &string_addr)) {
+            return "message_address_invalid";
+        }
+        error = tcg_debug_read_cached_ram(cs, string_addr, actual,
+                                          message_lengths[message], false);
+        if (error) {
+            return error;
+        }
+        if (memcmp(actual, messages[message], message_lengths[message])) {
+            return "message_mismatch";
+        }
+    }
+    return NULL;
+}
+
+/* The caller provides count * 9 + 1 bytes. */
+static void macpad_cal_format_words(char *out, const uint32_t *words,
+                                    unsigned int count)
+{
+    if (!count) {
+        out[0] = '\0';
+        return;
+    }
+    for (unsigned int i = 0; i < count; i++) {
+        snprintf(out + i * 9, 10, "%08" PRIx32 " ", words[i]);
+    }
+    out[count * 9 - 1] = '\0';
+}
+
+static void macpad_calibrate_restart(ARMCPU *cpu, const uint64_t *frame_lr,
+                                     int frame_count)
+{
+    static unsigned int samples;
+    CPUState *cs = CPU(cpu);
+    CPUARMState *env = &cpu->env;
+    unsigned int sample;
+    unsigned int previous;
+    unsigned int matches = 0;
+    unsigned int read_failures = 0;
+    uint64_t selected_lr = 0;
+    uint64_t call_pc = 0;
+    uint64_t destination = 0;
+    uint32_t selected_words[16] = { 0 };
+    uint32_t words[16];
+    uint32_t entry[MACPAD_CAL_ENTRY_WORDS];
+    uint32_t bl = 0;
+    uint8_t raw_bl[4];
+    int selected_index = -1;
+    int64_t displacement;
+    int64_t host_us;
+    const char *phase = "scan";
+    const char *result = "no_match";
+    const char *last_reject = "none";
+    const char *error;
+    bool captured = false;
+    char tag[128];
+    char caller_hex[16 * 9 + 1];
+    char entry_hex[MACPAD_CAL_ENTRY_WORDS * 9 + 1];
+
+    /* Observer-lifetime sample budget, not a guest boot/session identifier. */
+    sample = qatomic_read(&samples);
+    for (;;) {
+        if (sample >= MACPAD_CAL_MAX_RESETS) {
+            return;
+        }
+        previous = qatomic_cmpxchg(&samples, sample, sample + 1);
+        if (previous == sample) {
+            sample++;
+            break;
+        }
+        sample = previous;
+    }
+    host_us = g_get_monotonic_time();
+    snprintf(tag, sizeof(tag),
+             "MACPAD_RESET_CAL v=2 scope=observer pid=%ld sample=%u",
+             (long)getpid(), sample);
+
+    if (!is_a64(env)) {
+        result = "unsupported_aarch32";
+        goto report;
+    }
+    if (!frame_lr || frame_count < 0 ||
+        frame_count > MACPAD_CAL_MAX_FRAMES) {
+        result = "frame_count_invalid";
+        goto report;
+    }
+    for (int i = 0; i < frame_count; i++) {
+        error = macpad_cal_halt_site(cs, frame_lr[i], words);
+        if (error) {
+            last_reject = error;
+            if (strncmp(error, "read_", 5) == 0) {
+                read_failures++;
+            }
+            continue;
+        }
+        matches++;
+        if (matches == 1) {
+            selected_index = i;
+            selected_lr = frame_lr[i];
+            memcpy(selected_words, words, sizeof(selected_words));
+        }
+    }
+    if (matches != 1) {
+        result = matches ? "ambiguous" : "no_match";
+        selected_index = -1;
+        selected_lr = 0;
+        goto report;
+    }
+
+    phase = "bl";
+    call_pc = selected_lr - 4;
+    error = tcg_debug_read_cached_ram(cs, call_pc, raw_bl,
+                                      sizeof(raw_bl), true);
+    if (error) {
+        result = error;
+        goto report;
+    }
+    bl = ldl_le_p(raw_bl);
+    if ((bl & 0xfc000000) != 0x94000000) {
+        result = "not_bl";
+        goto report;
+    }
+    if (bl != selected_words[14]) {
+        result = "bl_changed";
+        goto report;
+    }
+    displacement = bl & 0x03ffffff;
+    if (displacement & (INT64_C(1) << 25)) {
+        displacement -= INT64_C(1) << 26;
+    }
+    displacement *= 4;
+    phase = "destination";
+    if (!macpad_cal_add_signed(call_pc, displacement, &destination) ||
+        !destination || (destination & 3) ||
+        (destination >= selected_lr - 0x3c &&
+         destination < selected_lr + 4)) {
+        result = "destination_invalid";
+        goto report;
+    }
+
+    phase = "entry";
+    error = tcg_debug_read_cached_ram(cs, destination, entry,
+                                      sizeof(entry), true);
+    if (error) {
+        result = error;
+        goto report;
+    }
+    for (unsigned int i = 0; i < MACPAD_CAL_ENTRY_WORDS; i++) {
+        entry[i] = le32_to_cpu(entry[i]);
+    }
+    result = "captured";
+    captured = true;
+
+report:
+    error_report(
+        "%s result=%s phase=%s design=ipa8-cal2 base=e4d5bbc "
+        "read_mode=cached_tlb host_us=%" PRId64
+        " cpu=%d psci_pc=0x%" PRIx64
+        " frames=%d matches=%u read_failures=%u last_reject=%s "
+        "frame=%d raw_lr=0x%" PRIx64 " call_pc=0x%" PRIx64
+        " bl=%08" PRIx32 " destination=0x%" PRIx64
+        " bytes=%u identity=unverified",
+        tag, result, phase, host_us, cs->cpu_index, env->pc,
+        frame_count, matches, read_failures, last_reject,
+        selected_index, selected_lr, call_pc, bl, destination,
+        captured ? (unsigned int)sizeof(entry) : 0U);
+    if (matches == 1) {
+        macpad_cal_format_words(caller_hex, selected_words, 16);
+        error_report("%s phase=caller start=0x%" PRIx64
+                     " bytes=64 words=%s",
+                     tag, selected_lr - 0x3c, caller_hex);
+    }
+    if (captured) {
+        macpad_cal_format_words(entry_hex, entry, MACPAD_CAL_ENTRY_WORDS);
+        error_report("%s phase=entry start=0x%" PRIx64
+                     " bytes=192 words=%s", tag, destination, entry_hex);
+    }
+}
 
 bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
 {
@@ -247,6 +510,8 @@ void arm_handle_psci_call(ARMCPU *cpu)
                 words[0], words[1], words[2], words[3],
                 words[4], words[5], words[6], words[7]);
         }
+
+        macpad_calibrate_restart(cpu, frame_lr, frame_count);
 
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI

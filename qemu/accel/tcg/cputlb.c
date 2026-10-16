@@ -41,6 +41,7 @@
 #include "exec/helper-proto-common.h"
 #include "exec/tlb-flags.h"
 #include "qemu/atomic.h"
+#include "qemu/rcu.h"
 #include "qemu/atomic128.h"
 #include "tb-internal.h"
 #include "trace.h"
@@ -1658,6 +1659,83 @@ void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
 
     /* No combination of flags are expected by the caller. */
     return flags ? NULL : host;
+}
+
+const char *tcg_debug_read_cached_ram(CPUState *cpu, vaddr addr,
+                                     void *buffer, size_t len,
+                                     bool is_code)
+{
+    MMUAccessType access = is_code ? MMU_INST_FETCH : MMU_DATA_LOAD;
+    uint8_t *out = buffer;
+    int mmu_idx;
+
+    if (cpu != current_cpu) {
+        return "read_wrong_cpu";
+    }
+    if (!buffer || !len || len > UINT64_MAX - addr) {
+        return "read_range";
+    }
+
+    mmu_idx = cpu_mmu_index(cpu, is_code);
+    RCU_READ_LOCK_GUARD();
+
+    while (len) {
+        CPUTLBEntry *entry;
+        CPUTLBEntryFull *full = NULL;
+        uint64_t tag;
+        size_t index;
+        size_t n;
+
+        if (!cpu_tlb_fast(cpu, mmu_idx)->table) {
+            return "read_cache_unavailable";
+        }
+
+        index = tlb_index(cpu, mmu_idx, addr);
+        entry = tlb_entry(cpu, mmu_idx, addr);
+        tag = tlb_read_idx(entry, access);
+
+        if (tlb_hit(tag, addr)) {
+            full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
+        } else {
+            /* Inspect victims without promotion, swapping, or a TLB fill. */
+            for (unsigned int i = 0; i < CPU_VTLB_SIZE; i++) {
+                CPUTLBEntry *victim =
+                    &cpu->neg.tlb.d[mmu_idx].vtable[i];
+                uint64_t victim_tag = tlb_read_idx(victim, access);
+
+                if (tlb_hit(victim_tag, addr)) {
+                    entry = victim;
+                    tag = victim_tag;
+                    full = &cpu->neg.tlb.d[mmu_idx].vfulltlb[i];
+                    break;
+                }
+            }
+        }
+
+        if (!full) {
+            return "read_cache_miss";
+        }
+        if ((tag & TLB_FLAGS_MASK) || full->slow_flags[access]) {
+            return "read_cache_flags";
+        }
+        if (full->lg_page_size < TARGET_PAGE_BITS) {
+            return "read_subpage";
+        }
+        if (!full->section ||
+            !memory_region_is_ram(full->section->mr) ||
+            memory_region_is_ram_device(full->section->mr)) {
+            return "read_not_ram";
+        }
+
+        n = MIN(len, (size_t)(TARGET_PAGE_SIZE -
+                             (addr & ~TARGET_PAGE_MASK)));
+        memcpy(out, (const void *)((uintptr_t)addr + entry->addend), n);
+        addr += n;
+        out += n;
+        len -= n;
+    }
+
+    return NULL;
 }
 
 /*

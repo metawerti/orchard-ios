@@ -92,6 +92,17 @@ void tlb_set_page(CPUState *cpu, vaddr addr,
                   int mmu_idx, vaddr size);
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
+/*
+ * Diagnostic read on the current TCG CPU, using only cached translations.
+ * Never fills/promotes TLB entries or walks guest page tables.  Only ordinary
+ * RAM with flag-free, full target-page mappings is accepted.  is_code selects
+ * instruction-fetch rather than data-load permissions.  Returns NULL on
+ * success or a constant error string; failure may leave a partial buffer.
+ */
+const char *tcg_debug_read_cached_ram(CPUState *cpu, vaddr addr,
+                                     void *buffer, size_t len,
+                                     bool is_code);
+
 /**
  * tlb_flush_page:
  * @cpu: CPU whose TLB should be flushed
