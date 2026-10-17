@@ -1,9 +1,9 @@
-name: IPA8 Cal2 Calibration
+name: IPA8.1 Frame Diagnostics
 
 on:
   push:
     branches:
-      - ipa8-cal2
+      - ipa8p1-frame-diagnostics
   workflow_dispatch:
 
 jobs:
@@ -38,9 +38,13 @@ jobs:
           scripts/build-ios.sh 2>&1 | tee ipa8-qemu-build.log
           grep -F 'ipa8-cal2' qemu/target/arm/tcg/psci.c
           grep -F 'MACPAD_RESET_CAL' qemu/target/arm/tcg/psci.c
+          grep -F 'mismatch_index=%d' qemu/target/arm/tcg/psci.c
+          grep -F 'string0_read=%u string0_match=%u' qemu/target/arm/tcg/psci.c
           strings qemu/build-ios/libqemu-aarch64-softmmu.dylib > ipa8-dylib-strings.txt
           grep -F 'design=ipa8-cal2' ipa8-dylib-strings.txt
           grep -F 'MACPAD_RESET_CAL' ipa8-dylib-strings.txt
+          grep -F 'mismatch_index=%d' ipa8-dylib-strings.txt
+          grep -F 'string0_read=%u string0_match=%u' ipa8-dylib-strings.txt
           shasum -a 256 qemu/build-ios/libqemu-aarch64-softmmu.dylib > ipa8-dylib.sha256
           git rev-parse HEAD > ipa8-commit.txt
           cp qemu/build-ios.cross.txt ipa8-cross.txt
@@ -53,22 +57,24 @@ jobs:
         run: |
           set -o pipefail
           ios/app/build.sh 2>&1 | tee ipa8-app-build.log
-          mv ios/app/Orchard.ipa ios/app/Orchard-IPA8-Cal2.ipa
+          mv ios/app/Orchard.ipa ios/app/Orchard-IPA8p1-FrameDiag.ipa
           mkdir ipa8-verify
-          unzip -q ios/app/Orchard-IPA8-Cal2.ipa -d ipa8-verify
+          unzip -q ios/app/Orchard-IPA8p1-FrameDiag.ipa -d ipa8-verify
           cmp qemu/build-ios/libqemu-aarch64-softmmu.dylib ipa8-verify/Payload/Orchard.app/Frameworks/libqemu-aarch64-softmmu.dylib || {
             strings ipa8-verify/Payload/Orchard.app/Frameworks/libqemu-aarch64-softmmu.dylib > ipa8-packaged-strings.txt
             grep -F 'design=ipa8-cal2' ipa8-packaged-strings.txt
             grep -F 'MACPAD_RESET_CAL' ipa8-packaged-strings.txt
+            grep -F 'mismatch_index=%d' ipa8-packaged-strings.txt
+            grep -F 'string0_read=%u string0_match=%u' ipa8-packaged-strings.txt
           }
-          shasum -a 256 ios/app/Orchard-IPA8-Cal2.ipa > ipa8-ipa.sha256
+          shasum -a 256 ios/app/Orchard-IPA8p1-FrameDiag.ipa > ipa8-ipa.sha256
 
-      - name: Upload IPA8 calibration IPA and evidence
+      - name: Upload IPA8.1 calibration IPA and evidence
         uses: actions/upload-artifact@v4
         with:
-          name: Orchard-IPA8-Cal2
+          name: Orchard-IPA8p1-FrameDiag
           path: |
-            ios/app/Orchard-IPA8-Cal2.ipa
+            ios/app/Orchard-IPA8p1-FrameDiag.ipa
             ipa8-*.log
             ipa8-*.txt
             ipa8-*.json

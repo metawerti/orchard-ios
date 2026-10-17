@@ -35,6 +35,22 @@
 #define MACPAD_CAL_MAX_RESETS 8U
 #define MACPAD_CAL_ENTRY_WORDS 48
 
+typedef struct MacpadCalFrameDiagnostic {
+    const char *stage;
+    const char *read_error;
+    /* Read request start; the cache reader does not report partial progress. */
+    uint64_t read_addr;
+    uint64_t caller_start;
+    bool caller_start_valid;
+    bool caller_read;
+    int mismatch_index;
+    uint32_t actual;
+    uint32_t expected;
+    uint32_t mask;
+    bool string_read[2];
+    bool string_match[2];
+} MacpadCalFrameDiagnostic;
+
 static bool macpad_cal_add_signed(uint64_t base, int64_t delta,
                                   uint64_t *result)
 {
@@ -58,7 +74,8 @@ static bool macpad_cal_add_signed(uint64_t base, int64_t delta,
 
 /* A different caller layout is a calibration miss, not permission to guess. */
 static const char *macpad_cal_halt_site(CPUState *cs, uint64_t raw_lr,
-                                      uint32_t words[16])
+                                      uint32_t words[16],
+                                      MacpadCalFrameDiagnostic *diag)
 {
     static const uint32_t expected[16] = {
         0xd503237f, 0xa9be4ff4, 0xa9017bfd, 0x910043fd,
@@ -82,17 +99,29 @@ static const char *macpad_cal_halt_site(CPUState *cs, uint64_t raw_lr,
     uint64_t start;
     const char *error;
 
+    diag->stage = "lr";
     if ((raw_lr & 3) || raw_lr < 0x3c || raw_lr > UINT64_MAX - 4) {
         return "raw_lr_invalid";
     }
     start = raw_lr - 0x3c;
+    diag->caller_start = start;
+    diag->caller_start_valid = true;
+    diag->stage = "caller_read";
+    diag->read_addr = start;
     error = tcg_debug_read_cached_ram(cs, start, raw, sizeof(raw), true);
     if (error) {
+        diag->read_error = error;
         return error;
     }
+    diag->caller_read = true;
+    diag->stage = "instruction_validation";
     for (unsigned int i = 0; i < 16; i++) {
         words[i] = ldl_le_p(raw + i * 4);
         if ((words[i] & masks[i]) != (expected[i] & masks[i])) {
+            diag->mismatch_index = i;
+            diag->actual = words[i];
+            diag->expected = expected[i];
+            diag->mask = masks[i];
             return "signature_mismatch";
         }
     }
@@ -105,6 +134,8 @@ static const char *macpad_cal_halt_site(CPUState *cs, uint64_t raw_lr,
         int64_t imm21;
         char actual[13];
 
+        diag->stage = message ? "string1_address" : "string0_address";
+        diag->read_addr = 0;
         imm21 = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3);
         if (imm21 & (INT64_C(1) << 20)) {
             imm21 -= INT64_C(1) << 21;
@@ -115,15 +146,22 @@ static const char *macpad_cal_halt_site(CPUState *cs, uint64_t raw_lr,
                                    &string_addr)) {
             return "message_address_invalid";
         }
+        diag->stage = message ? "string1_read" : "string0_read";
+        diag->read_addr = string_addr;
         error = tcg_debug_read_cached_ram(cs, string_addr, actual,
                                           message_lengths[message], false);
         if (error) {
+            diag->read_error = error;
             return error;
         }
+        diag->string_read[message] = true;
+        diag->stage = message ? "string1_validation" : "string0_validation";
         if (memcmp(actual, messages[message], message_lengths[message])) {
             return "message_mismatch";
         }
+        diag->string_match[message] = true;
     }
+    diag->stage = "validated";
     return NULL;
 }
 
@@ -166,6 +204,7 @@ static void macpad_calibrate_restart(ARMCPU *cpu, const uint64_t *frame_lr,
     const char *result = "no_match";
     const char *last_reject = "none";
     const char *error;
+    MacpadCalFrameDiagnostic diag;
     bool captured = false;
     char tag[128];
     char caller_hex[16 * 9 + 1];
@@ -199,14 +238,43 @@ static void macpad_calibrate_restart(ARMCPU *cpu, const uint64_t *frame_lr,
         goto report;
     }
     for (int i = 0; i < frame_count; i++) {
-        error = macpad_cal_halt_site(cs, frame_lr[i], words);
+        memset(&diag, 0, sizeof(diag));
+        diag.stage = "start";
+        diag.mismatch_index = -1;
+        error = macpad_cal_halt_site(cs, frame_lr[i], words, &diag);
         if (error) {
             last_reject = error;
             if (strncmp(error, "read_", 5) == 0) {
                 read_failures++;
             }
+            error_report(
+                "%s phase=frame frame=%d cpu=%d raw_lr=0x%" PRIx64
+                " caller_start_valid=%u caller_start=0x%" PRIx64
+                " stage=%s result=reject read_error=%s read_addr=0x%" PRIx64
+                " caller_read=%u mismatch_index=%d actual=%08" PRIx32
+                " expected=%08" PRIx32 " mask=%08" PRIx32
+                " string0_read=%u string0_match=%u"
+                " string1_read=%u string1_match=%u",
+                tag, i, cs->cpu_index, frame_lr[i],
+                diag.caller_start_valid, diag.caller_start, diag.stage,
+                diag.read_error ? diag.read_error : "none", diag.read_addr,
+                diag.caller_read, diag.mismatch_index, diag.actual,
+                diag.expected, diag.mask, diag.string_read[0],
+                diag.string_match[0], diag.string_read[1],
+                diag.string_match[1]);
             continue;
         }
+        error_report(
+            "%s phase=frame frame=%d cpu=%d"
+            " raw_lr=0x%" PRIx64 " caller_start_valid=%u"
+            " caller_start=0x%" PRIx64
+            " stage=%s result=validated caller_read=%u"
+            " mismatch_index=%d string0_read=%u string0_match=%u"
+            " string1_read=%u string1_match=%u",
+            tag, i, cs->cpu_index, frame_lr[i], diag.caller_start_valid,
+            diag.caller_start, diag.stage, diag.caller_read,
+            diag.mismatch_index, diag.string_read[0], diag.string_match[0],
+            diag.string_read[1], diag.string_match[1]);
         matches++;
         if (matches == 1) {
             selected_index = i;
