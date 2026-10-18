@@ -26,6 +26,9 @@
 #include "translate.h"
 #include "translate-a64.h"
 #include "tcg/tcg-op.h"
+#include "tcg/tcg.h"
+#include "qemu/atomic.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "semihosting/semihost.h"
 #include "cpregs.h"
@@ -36,6 +39,10 @@ static TCGv_i64 cpu_pc;
 
 /* Load/store exclusive handling */
 static TCGv_i64 cpu_exclusive_high;
+
+static uint32_t ipa9_ready_logged;
+static uint32_t ipa9_pe_signature_logged;
+static uint32_t ipa9_halt_signature_logged;
 
 static const char *regnames[] = {
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
@@ -11030,6 +11037,12 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     int bound, core_mmu_idx;
 
     dc->isar = &arm_cpu->isar;
+    dc->ipa9_pe_entry_match = 0;
+    dc->ipa9_pe_entry_pc = 0;
+    dc->ipa9_pe_entry_start = NULL;
+    dc->ipa9_halt_entry_match = 0;
+    dc->ipa9_halt_entry_pc = 0;
+    dc->ipa9_halt_entry_start = NULL;
     dc->condjmp = 0;
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = true;
@@ -11133,6 +11146,11 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
 
 static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
+    if (qatomic_cmpxchg(&ipa9_ready_logged, 0, 1) == 0) {
+        error_report("IPA9_READY host_us=%" PRId64 " cpu=%d pc=0x%016" PRIx64,
+                     (int64_t)g_get_monotonic_time(), cpu->cpu_index,
+                     db->pc_first);
+    }
 }
 
 static void aarch64_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
@@ -11147,12 +11165,163 @@ static void aarch64_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     dc->insn_start_updated = false;
 }
 
+#define IPA9_PE_SIGNATURE_WORDS 3
+
+static const uint32_t ipa9_pe_signature[IPA9_PE_SIGNATURE_WORDS] = {
+    0xd503245f, /* bti c */
+    0x52800001, /* mov w1, #0 */
+    0x17ffff00, /* b 0xfffffe0008265120 from 0xfffffe0008265520 */
+};
+
+static void aarch64_ipa9_log_signature_once(uint32_t *logged,
+                                            const char *name,
+                                            CPUState *cpu, uint64_t pc)
+{
+    if (qatomic_cmpxchg(logged, 0, 1) == 0) {
+        error_report("IPA9_%s_SIG_TRANSLATED host_us=%" PRId64
+                     " cpu=%d pc=0x%016" PRIx64,
+                     name, (int64_t)g_get_monotonic_time(),
+                     cpu->cpu_index, pc);
+    }
+}
+
+static void aarch64_ipa9_match_pe(DisasContext *s, uint64_t pc,
+                                  uint32_t insn, bool block_ending,
+                                  CPUState *cpu)
+{
+    unsigned next = s->ipa9_pe_entry_match;
+
+    if (next != 0) {
+        bool terminal_expected = next == IPA9_PE_SIGNATURE_WORDS - 1;
+
+        if (pc != s->ipa9_pe_entry_pc + (uint64_t)next * 4 ||
+            insn != ipa9_pe_signature[next] ||
+            block_ending != terminal_expected) {
+            s->ipa9_pe_entry_match = 0;
+            s->ipa9_pe_entry_pc = 0;
+            s->ipa9_pe_entry_start = NULL;
+            next = 0;
+        }
+    }
+
+    if (next == 0) {
+        if (block_ending || insn != ipa9_pe_signature[0]) {
+            return;
+        }
+        s->ipa9_pe_entry_match = 1;
+        s->ipa9_pe_entry_pc = pc;
+        s->ipa9_pe_entry_start = s->base.insn_start;
+        return;
+    }
+
+    if (next == IPA9_PE_SIGNATURE_WORDS - 1) {
+        /* Accept only after the exact final B decoded and ended this TB. */
+        if (block_ending && s->ipa9_pe_entry_start != NULL &&
+            tcg_ctx->emit_before_op == NULL) {
+            tcg_ctx->emit_before_op = s->ipa9_pe_entry_start;
+            gen_helper_ipa9_pe_entry_observer(
+                tcg_env, tcg_constant_i64(s->ipa9_pe_entry_pc));
+            tcg_ctx->emit_before_op = NULL;
+        }
+        aarch64_ipa9_log_signature_once(&ipa9_pe_signature_logged,
+                                        "PE", cpu,
+                                        s->ipa9_pe_entry_pc);
+        s->ipa9_pe_entry_match = 0;
+        s->ipa9_pe_entry_pc = 0;
+        s->ipa9_pe_entry_start = NULL;
+        return;
+    }
+
+    s->ipa9_pe_entry_match++;
+}
+
+#define IPA9_HALT_SIGNATURE_WORDS 12
+
+static const uint32_t ipa9_halt_signature[IPA9_HALT_SIGNATURE_WORDS] = {
+    0xd503237f, /* pacibsp */
+    0xa9be4ff4, /* stp x20, x19, [sp, #-32]! */
+    0xa9017bfd, /* stp x29, x30, [sp, #16] */
+    0x910043fd, /* add x29, sp, #16 */
+    0x7100001f, /* cmp w0, #0 */
+    0x1a9f07f3, /* cset w19, ne */
+    0xf0ff9b28, /* adrp x8, (page immediate masked) */
+    0x91128508, /* add x8, x8, (imm12 masked) */
+    0xf0ff9b29, /* adrp x9, (page immediate masked) */
+    0x9112b929, /* add x9, x9, (imm12 masked) */
+    0x9a880120, /* csel x0, x8, x9, eq */
+    0x97fbd329, /* bl (target immediate masked; terminal instruction) */
+};
+
+static const uint32_t ipa9_halt_masks[IPA9_HALT_SIGNATURE_WORDS] = {
+    0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+    0xffffffff, 0xffffffff, 0x9f00001f, 0xffc003ff,
+    0x9f00001f, 0xffc003ff, 0xffffffff, 0xfc000000,
+};
+
+static void aarch64_ipa9_match_halt(DisasContext *s, uint64_t pc,
+                                    uint32_t insn, bool block_ending,
+                                    CPUState *cpu)
+{
+    unsigned next = s->ipa9_halt_entry_match;
+
+    if (next != 0) {
+        bool terminal_expected =
+            next == IPA9_HALT_SIGNATURE_WORDS - 1;
+
+        if (pc != s->ipa9_halt_entry_pc + (uint64_t)next * 4 ||
+            (insn & ipa9_halt_masks[next]) !=
+                (ipa9_halt_signature[next] & ipa9_halt_masks[next]) ||
+            block_ending != terminal_expected) {
+            s->ipa9_halt_entry_match = 0;
+            s->ipa9_halt_entry_pc = 0;
+            s->ipa9_halt_entry_start = NULL;
+            next = 0;
+        }
+    }
+
+    if (next == 0) {
+        if (block_ending ||
+            (insn & ipa9_halt_masks[0]) !=
+                (ipa9_halt_signature[0] & ipa9_halt_masks[0])) {
+            return;
+        }
+        s->ipa9_halt_entry_match = 1;
+        s->ipa9_halt_entry_pc = pc;
+        s->ipa9_halt_entry_start = s->base.insn_start;
+        return;
+    }
+
+    if (next == IPA9_HALT_SIGNATURE_WORDS - 1) {
+        /*
+         * The final BL decoded successfully and ended this TB.  Insert
+         * the helper before the saved first-instruction marker, not here.
+         */
+        if (block_ending && s->ipa9_halt_entry_start != NULL &&
+            tcg_ctx->emit_before_op == NULL) {
+            tcg_ctx->emit_before_op = s->ipa9_halt_entry_start;
+            gen_helper_ipa9_halt_entry_observer(
+                tcg_env, tcg_constant_i64(s->ipa9_halt_entry_pc));
+            tcg_ctx->emit_before_op = NULL;
+        }
+        aarch64_ipa9_log_signature_once(&ipa9_halt_signature_logged,
+                                        "HALT", cpu,
+                                        s->ipa9_halt_entry_pc);
+        s->ipa9_halt_entry_match = 0;
+        s->ipa9_halt_entry_pc = 0;
+        s->ipa9_halt_entry_start = NULL;
+        return;
+    }
+
+    s->ipa9_halt_entry_match++;
+}
+
 static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *s = container_of(dcbase, DisasContext, base);
     CPUARMState *env = cpu_env(cpu);
     uint64_t pc = s->base.pc_next;
     uint32_t insn;
+    bool decoded;
 
     /* Singlestep exceptions have the highest priority. */
     if (s->ss_active && !s->pstate_ss) {
@@ -11234,10 +11403,19 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         disas_sme_fa64(s, insn);
     }
 
-    if (!disas_a64(s, insn) &&
-        !disas_sme(s, insn) &&
-        !disas_sve(s, insn)) {
+    decoded = disas_a64(s, insn) ||
+              disas_sme(s, insn) ||
+              disas_sve(s, insn);
+    if (!decoded) {
         unallocated_encoding(s);
+    }
+
+    if (decoded && (s->base.is_jmp == DISAS_NEXT ||
+                    s->base.is_jmp == DISAS_NORETURN)) {
+        bool block_ending = s->base.is_jmp == DISAS_NORETURN;
+
+        aarch64_ipa9_match_pe(s, pc, insn, block_ending, cpu);
+        aarch64_ipa9_match_halt(s, pc, insn, block_ending, cpu);
     }
 
     /*

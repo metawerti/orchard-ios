@@ -18,6 +18,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
+#include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "gdbstub/helpers.h"
@@ -47,6 +49,92 @@
 
 #define HELPER_H "tcg/helper-a64-defs.h"
 #include "exec/helper-info.c.inc"
+
+#define IPA9_ENTRY_LOG_LIMIT 32
+#define IPA9_RESET_SUMMARY_LOG_LIMIT 8
+
+static uint64_t ipa9_entry_event_sequence;
+static uint64_t ipa9_pe_entry_count;
+static uint64_t ipa9_halt_entry_count;
+static uint64_t ipa9_reset_summary_count;
+
+void HELPER(ipa9_pe_entry_observer)(CPUARMState *env, uint64_t pc)
+{
+    uint64_t count = qatomic_fetch_inc(&ipa9_pe_entry_count) + 1;
+    uint64_t event = qatomic_fetch_inc(&ipa9_entry_event_sequence) + 1;
+    uint64_t lr = env->xregs[30];
+    bool lr4_valid = lr >= 4 && (lr & 3) == 0;
+    CPUState *cs = env_cpu(env);
+
+    if (count > IPA9_ENTRY_LOG_LIMIT) {
+        return;
+    }
+
+    error_report("IPA9_PE_ENTRY event=%" PRIu64
+                 " host_us=%" PRId64 " cpu=%d state=pre_instruction"
+                 " pc=0x%016" PRIx64 " x0_type_raw=0x%016" PRIx64
+                 " x1_raw=0x%016" PRIx64 " lr_raw=0x%016" PRIx64
+                 " lr4_candidate_valid=%u lr4_candidate=0x%016" PRIx64
+                 " sp=0x%016" PRIx64 " fp=0x%016" PRIx64,
+                 event, (int64_t)g_get_monotonic_time(), cs->cpu_index, pc,
+                 env->xregs[0], env->xregs[1], lr, lr4_valid,
+                 lr4_valid ? lr - 4 : 0, env->xregs[31], env->xregs[29]);
+}
+
+void HELPER(ipa9_halt_entry_observer)(CPUARMState *env, uint64_t pc)
+{
+    uint64_t count = qatomic_fetch_inc(&ipa9_halt_entry_count) + 1;
+    uint64_t event = qatomic_fetch_inc(&ipa9_entry_event_sequence) + 1;
+    uint64_t lr = env->xregs[30];
+    bool lr4_valid = lr >= 4 && (lr & 3) == 0;
+    CPUState *cs = env_cpu(env);
+
+    if (count > IPA9_ENTRY_LOG_LIMIT) {
+        return;
+    }
+
+    error_report("IPA9_HALT_ENTRY event=%" PRIu64
+                 " host_us=%" PRId64 " cpu=%d state=pre_instruction"
+                 " pc=0x%016" PRIx64 " x0_raw=0x%016" PRIx64
+                 " x1_raw=0x%016" PRIx64 " lr_raw=0x%016" PRIx64
+                 " lr4_candidate_valid=%u lr4_candidate=0x%016" PRIx64
+                 " sp=0x%016" PRIx64 " fp=0x%016" PRIx64,
+                 event, (int64_t)g_get_monotonic_time(), cs->cpu_index, pc,
+                 env->xregs[0], env->xregs[1], lr, lr4_valid,
+                 lr4_valid ? lr - 4 : 0, env->xregs[31], env->xregs[29]);
+}
+
+void arm_ipa9_log_reset_summary(CPUARMState *env)
+{
+    uint64_t summary_count;
+    uint64_t pe;
+    uint64_t halt;
+    uint64_t sequence;
+    uint64_t pe_suppressed;
+    uint64_t halt_suppressed;
+    CPUState *cs;
+
+    summary_count = qatomic_fetch_inc(&ipa9_reset_summary_count) + 1;
+    if (summary_count > IPA9_RESET_SUMMARY_LOG_LIMIT) {
+        return;
+    }
+
+    pe = qatomic_read(&ipa9_pe_entry_count);
+    halt = qatomic_read(&ipa9_halt_entry_count);
+    sequence = qatomic_read(&ipa9_entry_event_sequence);
+    pe_suppressed = pe > IPA9_ENTRY_LOG_LIMIT
+        ? pe - IPA9_ENTRY_LOG_LIMIT : 0;
+    halt_suppressed = halt > IPA9_ENTRY_LOG_LIMIT
+        ? halt - IPA9_ENTRY_LOG_LIMIT : 0;
+    cs = env_cpu(env);
+
+    error_report("IPA9_RESET_SUMMARY host_us=%" PRId64 " cpu=%d"
+                 " event_sequence=%" PRIu64
+                 " pe_entries=%" PRIu64 " pe_suppressed=%" PRIu64
+                 " halt_entries=%" PRIu64 " halt_suppressed=%" PRIu64,
+                 (int64_t)g_get_monotonic_time(), cs->cpu_index, sequence,
+                 pe, pe_suppressed, halt, halt_suppressed);
+}
 
 /* C2.4.7 Multiply and divide */
 /* special cases for 0 and LLONG_MIN are mandated by the standard */

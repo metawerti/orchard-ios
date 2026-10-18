@@ -1,0 +1,124 @@
+name: Orchard IPA9 Dual Observer
+
+on:
+  push:
+    branches:
+      - macpad-ipa9-dual-observer
+
+jobs:
+  build:
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout exact IPA9 branch
+        uses: actions/checkout@v4
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install existing iOS build toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install existing pipeline build tools
+        run: brew install ninja pkgconf glib pixman libslirp qemu
+
+      - name: Fetch existing iOS dependencies
+        run: scripts/fetch-ios-deps.sh
+
+      - name: Build and verify IPA9 QEMU dylib
+        run: |
+          set -euo pipefail
+          scripts/build-ios.sh 2>&1 | tee ipa9-qemu-build.log
+
+          src=qemu/target/arm/tcg/translate-a64.c
+          helper=qemu/target/arm/tcg/helper-a64.c
+          psci=qemu/target/arm/tcg/psci.c
+          lib=qemu/build-ios/libqemu-aarch64-softmmu.dylib
+
+          grep -F 'IPA9_PE_SIGNATURE_WORDS 3' "$src"
+          grep -F 'IPA9_HALT_SIGNATURE_WORDS 12' "$src"
+          grep -F '0xd503245f' "$src"
+          grep -F '0x17ffff00' "$src"
+          grep -F '0xd503237f' "$src"
+          grep -F '0x97fbd329' "$src"
+          grep -F 'IPA9_ENTRY_LOG_LIMIT 32' "$helper"
+          grep -F 'IPA9_RESET_SUMMARY_LOG_LIMIT 8' "$helper"
+          grep -F 'arm_ipa9_log_reset_summary(env)' "$psci"
+          grep -F 'qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET)' "$psci"
+
+          strings "$lib" > ipa9-dylib-strings.txt
+          for marker in 'IPA9_READY ' 'IPA9_%s_SIG_TRANSLATED ' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_FRAME ' 'MACPAD_RESET_CODE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa9-dylib-strings.txt
+          done
+
+          nm -a "$lib" > ipa9-dylib-symbols.txt
+          grep -E 'helper_ipa9_pe_entry_observer|helper_ipa9_halt_entry_observer|arm_ipa9_log_reset_summary' ipa9-dylib-symbols.txt
+
+          vtool -show-build-version "$lib" | tee ipa9-dylib-platform.txt
+          shasum -a 256 "$lib" > ipa9-dylib.sha256
+          git rev-parse HEAD > ipa9-commit.txt
+          printf '%s\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > ipa9-workflow-run.txt
+          cp qemu/build-ios.cross.txt ipa9-cross.txt
+          cp qemu/build-ios/compile_commands.json ipa9-compile-commands.json
+
+      - name: Build IPA and verify bundled QEMU
+        env:
+          ORCHARD_NO_ICON: "1"
+          ORCHARD_NO_NSIO: "1"
+        run: |
+          set -euo pipefail
+          ios/app/build.sh 2>&1 | tee ipa9-app-build.log
+
+          ipa=ios/app/Orchard-MacPad-IPA9-DualObserver.ipa
+          test -s ios/app/Orchard.ipa
+          mv ios/app/Orchard.ipa "$ipa"
+
+          mkdir ipa9-verify
+          unzip -q "$ipa" -d ipa9-verify
+          app=ipa9-verify/Payload/Orchard.app
+          bundled="$app/Frameworks/libqemu-aarch64-softmmu.dylib"
+          test -s "$app/Info.plist"
+          test -s "$app/Orchard"
+          test -s "$bundled"
+
+          if cmp -s qemu/build-ios/libqemu-aarch64-softmmu.dylib "$bundled"; then
+            printf 'packaged dylib is byte-for-byte identical\n' > ipa9-package-compare.txt
+          else
+            printf 'packaged dylib differs bytewise; checking required linked markers\n' > ipa9-package-compare.txt
+          fi
+
+          strings "$bundled" > ipa9-packaged-strings.txt
+          for marker in 'IPA9_READY ' 'IPA9_%s_SIG_TRANSLATED ' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa9-packaged-strings.txt
+          done
+
+          file "$bundled" | tee ipa9-packaged-dylib-file.txt
+          lipo -archs "$bundled" | tee ipa9-packaged-dylib-arches.txt
+          grep -F arm64 ipa9-packaged-dylib-arches.txt
+          shasum -a 256 "$ipa" > ipa9-ipa.sha256
+          stat -f 'ipa_size_bytes=%z' "$ipa" > ipa9-ipa-size.txt
+          test -s "$ipa"
+
+      - name: Upload isolated IPA9 artifact and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: Orchard-MacPad-IPA9-DualObserver
+          path: |
+            ios/app/Orchard-MacPad-IPA9-DualObserver.ipa
+            ipa9-*.log
+            ipa9-*.txt
+            ipa9-*.json
+            ipa9-*.sha256
+          if-no-files-found: error

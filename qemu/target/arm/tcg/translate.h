@@ -38,6 +38,13 @@ typedef struct DisasDelayException {
 
 typedef struct DisasContext {
     DisasContextBase base;
+    /* IPA9 signature observer state is local to one translated TB. */
+    unsigned ipa9_pe_entry_match;
+    vaddr ipa9_pe_entry_pc;
+    struct TCGOp *ipa9_pe_entry_start;
+    unsigned ipa9_halt_entry_match;
+    vaddr ipa9_halt_entry_pc;
+    struct TCGOp *ipa9_halt_entry_start;
     const ARMISARegisters *isar;
     DisasDelayException *delay_excp_list;
 

@@ -581,6 +581,9 @@ void arm_handle_psci_call(ARMCPU *cpu)
 
         macpad_calibrate_restart(cpu, frame_lr, frame_count);
 
+#ifdef CONFIG_TCG
+        arm_ipa9_log_reset_summary(env);
+#endif
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI
          * mandates that we never return from the reset/shutdown
