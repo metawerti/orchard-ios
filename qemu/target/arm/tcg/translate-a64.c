@@ -11149,7 +11149,7 @@ static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
     if (qatomic_cmpxchg(&ipa9_ready_logged, 0, 1) == 0) {
         error_report("IPA9_READY host_us=%" PRId64 " cpu=%d pc=0x%016" PRIx64,
                      (int64_t)g_get_monotonic_time(), cpu->cpu_index,
-                     db->pc_first);
+                     (uint64_t)db->pc_first);
     }
 }
 
