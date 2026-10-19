@@ -1,0 +1,148 @@
+name: Orchard IPA10 Caller Observer
+
+on:
+  push:
+    branches:
+      - macpad-ipa10-caller-observer
+
+jobs:
+  build:
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout exact IPA10 branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install existing iOS build toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install existing pipeline build tools
+        run: brew install ninja pkgconf glib pixman libslirp qemu
+
+      - name: Fetch existing iOS dependencies
+        run: scripts/fetch-ios-deps.sh
+
+      - name: Build and verify IPA10 QEMU dylib
+        run: |
+          set -euo pipefail
+          scripts/build-ios.sh 2>&1 | tee ipa10-qemu-build.log
+
+          src=qemu/target/arm/tcg/translate-a64.c
+          helper=qemu/target/arm/tcg/helper-a64.c
+          psci=qemu/target/arm/tcg/psci.c
+          lib=qemu/build-ios/libqemu-aarch64-softmmu.dylib
+          base=8c14478749dd1747150ee45845c8e8f09c220305
+
+          git diff --check "$base" HEAD
+          git diff "$base" HEAD -- \
+            qemu/target/arm/tcg/translate-a64.c \
+            qemu/target/arm/tcg/translate.h \
+            qemu/target/arm/tcg/helper-a64-defs.h \
+            qemu/target/arm/tcg/helper-a64.c \
+            qemu/target/arm/cpu.h \
+            qemu/target/arm/tcg/psci.c \
+            .github/workflows/ipa10-caller-observer.yml \
+            > ipa10-source-diff.patch
+
+          grep -F 'IPA10_RESTART_CALL_SIGNATURE_WORDS 4' "$src"
+          grep -F '0xb8293108' "$src"
+          grep -F '0xfc000000' "$src"
+          grep -F 'IPA9_PE_SIGNATURE_WORDS 3' "$src"
+          grep -F 'IPA9_HALT_SIGNATURE_WORDS 12' "$src"
+          grep -F 'IPA10_RESTART_EVENT_CAPACITY 32' "$helper"
+          grep -F 'IPA9_RESET_SUMMARY_LOG_LIMIT 8' "$helper"
+          grep -F 'arm_ipa9_log_reset_summary(env)' "$psci"
+          grep -F 'arm_ipa10_flush_restart_events(env)' "$psci"
+          grep -F 'qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET)' "$psci"
+
+          strings "$lib" > ipa10-dylib-strings.txt
+          for marker in 'IPA10_CALLER_ENTRY event=' \
+                        'IPA10_CALLER_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_SIG_TRANSLATED' \
+                        'IPA9_READY ' 'IPA9_%s_SIG_TRANSLATED ' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_FRAME ' 'MACPAD_RESET_CODE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa10-dylib-strings.txt
+          done
+
+          nm -a "$lib" > ipa10-dylib-symbols.txt
+          grep -E 'helper_ipa10_restart_callsite_observer|arm_ipa10_flush_restart_events' ipa10-dylib-symbols.txt
+          grep -E 'helper_ipa9_pe_entry_observer|helper_ipa9_halt_entry_observer|arm_ipa9_log_reset_summary' ipa10-dylib-symbols.txt
+
+          vtool -show-build-version "$lib" | tee ipa10-dylib-platform.txt
+          shasum -a 256 "$lib" > ipa10-dylib.sha256
+          git rev-parse HEAD > ipa10-commit.txt
+          printf '%s\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > ipa10-workflow-run.txt
+          cp qemu/build-ios.cross.txt ipa10-cross.txt
+          cp qemu/build-ios/compile_commands.json ipa10-compile-commands.json
+
+      - name: Build IPA and verify packaged QEMU
+        env:
+          ORCHARD_NO_ICON: "1"
+          ORCHARD_NO_NSIO: "1"
+        run: |
+          set -euo pipefail
+          ios/app/build.sh 2>&1 | tee ipa10-app-build.log
+
+          ipa=ios/app/Orchard-MacPad-IPA10-CallerObserver.ipa
+          test -s ios/app/Orchard.ipa
+          mv ios/app/Orchard.ipa "$ipa"
+
+          unzip -t "$ipa" | tee ipa10-ipa-integrity.txt
+          mkdir ipa10-verify
+          unzip -q "$ipa" -d ipa10-verify
+          app=ipa10-verify/Payload/Orchard.app
+          bundled="$app/Frameworks/libqemu-aarch64-softmmu.dylib"
+          test -s "$app/Info.plist"
+          test -s "$app/Orchard"
+          test -s "$bundled"
+          plutil -extract CFBundleIdentifier raw -o - "$app/Info.plist" | tee ipa10-bundle-id.txt
+
+          if cmp -s qemu/build-ios/libqemu-aarch64-softmmu.dylib "$bundled"; then
+            printf 'packaged dylib is byte-for-byte identical\n' > ipa10-package-compare.txt
+          else
+            printf 'packaged dylib differs bytewise; required markers checked below\n' > ipa10-package-compare.txt
+          fi
+
+          strings "$bundled" > ipa10-packaged-strings.txt
+          for marker in 'IPA10_CALLER_ENTRY event=' \
+                        'IPA10_CALLER_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_SIG_TRANSLATED' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa10-packaged-strings.txt
+          done
+
+          file "$bundled" | tee ipa10-packaged-dylib-file.txt
+          lipo -archs "$bundled" | tee ipa10-packaged-dylib-arches.txt
+          grep -F arm64 ipa10-packaged-dylib-arches.txt
+          shasum -a 256 "$bundled" > ipa10-packaged-dylib.sha256
+          shasum -a 256 "$ipa" > ipa10-ipa.sha256
+          stat -f 'ipa_size_bytes=%z' "$ipa" > ipa10-ipa-size.txt
+          test -s "$ipa"
+
+      - name: Upload isolated IPA10 artifact and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: Orchard-MacPad-IPA10-CallerObserver
+          path: |
+            ios/app/Orchard-MacPad-IPA10-CallerObserver.ipa
+            ipa10-*.log
+            ipa10-*.txt
+            ipa10-*.patch
+            ipa10-*.json
+            ipa10-*.sha256
+          if-no-files-found: error

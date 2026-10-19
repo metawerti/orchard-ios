@@ -1380,6 +1380,7 @@ void arm_emulate_firmware_reset(CPUState *cpustate, int target_el);
 
 #ifdef CONFIG_TCG
 void arm_ipa9_log_reset_summary(CPUARMState *env);
+void arm_ipa10_flush_restart_events(CPUARMState *env);
 #endif
 
 int aarch64_cpu_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg);

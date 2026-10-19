@@ -43,6 +43,7 @@ static TCGv_i64 cpu_exclusive_high;
 static uint32_t ipa9_ready_logged;
 static uint32_t ipa9_pe_signature_logged;
 static uint32_t ipa9_halt_signature_logged;
+static uint32_t ipa10_restart_call_signature_translations;
 
 static const char *regnames[] = {
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
@@ -11043,6 +11044,8 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->ipa9_halt_entry_match = 0;
     dc->ipa9_halt_entry_pc = 0;
     dc->ipa9_halt_entry_start = NULL;
+    dc->ipa10_restart_call_match = 0;
+    dc->ipa10_restart_call_pc = 0;
     dc->condjmp = 0;
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = true;
@@ -11183,6 +11186,96 @@ static void aarch64_ipa9_log_signature_once(uint32_t *logged,
                      name, (int64_t)g_get_monotonic_time(),
                      cpu->cpu_index, pc);
     }
+}
+
+#define IPA10_RESTART_CALL_SIGNATURE_WORDS 4
+
+/*
+ * Unique Ventura 22G120 reference call-site words. The last word is a direct
+ * BL; matching is TB-local and the observer is inserted before that BL so
+ * x0/x1 still contain the arguments about to enter its target.
+ */
+static const uint32_t ipa10_restart_call_signature[
+    IPA10_RESTART_CALL_SIGNATURE_WORDS] = {
+    0xb8293108, /* ldset w9, w8, [x8] */
+    0xb9400260, /* ldr w0, [x19] */
+    0xaa1503e1, /* mov x1, x21 */
+    0x94000000, /* bl, displacement masked */
+};
+
+static const uint32_t ipa10_restart_call_masks[
+    IPA10_RESTART_CALL_SIGNATURE_WORDS] = {
+    0xffffffff, 0xffffffff, 0xffffffff, 0xfc000000,
+};
+
+static void aarch64_ipa10_match_restart_call(DisasContext *s, uint64_t pc,
+                                             uint32_t insn,
+                                             bool block_ending,
+                                             CPUState *cpu)
+{
+    unsigned next = s->ipa10_restart_call_match;
+
+    if (next != 0) {
+        bool terminal_expected =
+            next == IPA10_RESTART_CALL_SIGNATURE_WORDS - 1;
+
+        if (pc != s->ipa10_restart_call_pc + (uint64_t)next * 4 ||
+            (insn & ipa10_restart_call_masks[next]) !=
+                (ipa10_restart_call_signature[next] &
+                 ipa10_restart_call_masks[next]) ||
+            block_ending != terminal_expected) {
+            s->ipa10_restart_call_match = 0;
+            s->ipa10_restart_call_pc = 0;
+            next = 0;
+        }
+    }
+
+    if (next == 0) {
+        if (block_ending ||
+            (insn & ipa10_restart_call_masks[0]) !=
+                (ipa10_restart_call_signature[0] &
+                 ipa10_restart_call_masks[0])) {
+            return;
+        }
+        s->ipa10_restart_call_match = 1;
+        s->ipa10_restart_call_pc = pc;
+        return;
+    }
+
+    if (next == IPA10_RESTART_CALL_SIGNATURE_WORDS - 1) {
+        /*
+         * The exact BL decoded and ended this TB. Emit at its own instruction
+         * marker, after the argument loads but before BL changes x30 or PC.
+         */
+        if (block_ending && s->base.insn_start != NULL &&
+            tcg_ctx->emit_before_op == NULL) {
+            uint64_t target_pc = pc +
+                ((uint64_t)(int64_t)sextract32(insn, 0, 26) << 2);
+
+            tcg_ctx->emit_before_op = s->base.insn_start;
+            gen_helper_ipa10_restart_callsite_observer(
+                tcg_env, tcg_constant_i64(pc),
+                tcg_constant_i64((int64_t)target_pc));
+            tcg_ctx->emit_before_op = NULL;
+
+            uint32_t translation =
+                qatomic_fetch_inc(&ipa10_restart_call_signature_translations) +
+                1;
+
+            if (translation <= 8) {
+                error_report("IPA10_CALLER_SIG_TRANSLATED"
+                             " translation=%u"
+                             " translation_cpu=%d pc=0x%016" PRIx64
+                             " bl_target=0x%016" PRIx64,
+                             translation, cpu->cpu_index, pc, target_pc);
+            }
+        }
+        s->ipa10_restart_call_match = 0;
+        s->ipa10_restart_call_pc = 0;
+        return;
+    }
+
+    s->ipa10_restart_call_match++;
 }
 
 static void aarch64_ipa9_match_pe(DisasContext *s, uint64_t pc,
@@ -11416,6 +11509,7 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 
         aarch64_ipa9_match_pe(s, pc, insn, block_ending, cpu);
         aarch64_ipa9_match_halt(s, pc, insn, block_ending, cpu);
+        aarch64_ipa10_match_restart_call(s, pc, insn, block_ending, cpu);
     }
 
     /*

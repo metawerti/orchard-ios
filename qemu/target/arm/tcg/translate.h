@@ -45,6 +45,9 @@ typedef struct DisasContext {
     unsigned ipa9_halt_entry_match;
     vaddr ipa9_halt_entry_pc;
     struct TCGOp *ipa9_halt_entry_start;
+    /* IPA10 upstream restart-call signature; never spans translation blocks. */
+    unsigned ipa10_restart_call_match;
+    vaddr ipa10_restart_call_pc;
     const ARMISARegisters *isar;
     DisasDelayException *delay_excp_list;
 

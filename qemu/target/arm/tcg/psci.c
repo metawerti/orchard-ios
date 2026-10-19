@@ -583,6 +583,7 @@ void arm_handle_psci_call(ARMCPU *cpu)
 
 #ifdef CONFIG_TCG
         arm_ipa9_log_reset_summary(env);
+        arm_ipa10_flush_restart_events(env);
 #endif
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         /* QEMU reset and shutdown are async requests, but PSCI

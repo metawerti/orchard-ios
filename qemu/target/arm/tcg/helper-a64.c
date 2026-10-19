@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
 #include "qemu/error-report.h"
+#include "qemu/thread.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "gdbstub/helpers.h"
@@ -52,11 +53,125 @@
 
 #define IPA9_ENTRY_LOG_LIMIT 32
 #define IPA9_RESET_SUMMARY_LOG_LIMIT 8
+#define IPA10_RESTART_EVENT_CAPACITY 32
 
 static uint64_t ipa9_entry_event_sequence;
 static uint64_t ipa9_pe_entry_count;
 static uint64_t ipa9_halt_entry_count;
 static uint64_t ipa9_reset_summary_count;
+
+typedef struct IPA10RestartEvent {
+    uint64_t event;
+    uint64_t pc;
+    uint64_t target_pc;
+    uint64_t x0;
+    uint64_t x1;
+    uint64_t lr;
+    uint64_t sp;
+    uint64_t fp;
+    int64_t host_us;
+    int cpu;
+} IPA10RestartEvent;
+
+static QemuMutex ipa10_restart_event_lock;
+static gsize ipa10_restart_event_lock_initialized;
+static IPA10RestartEvent
+    ipa10_restart_events[IPA10_RESTART_EVENT_CAPACITY];
+static unsigned ipa10_restart_event_head;
+static unsigned ipa10_restart_event_count;
+static uint64_t ipa10_restart_event_total;
+static uint64_t ipa10_restart_event_overwritten;
+static bool ipa10_restart_events_frozen;
+
+static void ipa10_restart_event_lock_init(void)
+{
+    if (g_once_init_enter(&ipa10_restart_event_lock_initialized)) {
+        qemu_mutex_init(&ipa10_restart_event_lock);
+        g_once_init_leave(&ipa10_restart_event_lock_initialized, 1);
+    }
+}
+
+void HELPER(ipa10_restart_callsite_observer)(CPUARMState *env, uint64_t pc,
+                                              uint64_t target_pc)
+{
+    CPUState *cs = env_cpu(env);
+
+    ipa10_restart_event_lock_init();
+    qemu_mutex_lock(&ipa10_restart_event_lock);
+    if (!ipa10_restart_events_frozen) {
+        IPA10RestartEvent *event =
+            &ipa10_restart_events[ipa10_restart_event_head];
+
+        event->event = ++ipa10_restart_event_total;
+        event->pc = pc;
+        event->target_pc = target_pc;
+        event->x0 = env->xregs[0];
+        event->x1 = env->xregs[1];
+        event->lr = env->xregs[30];
+        event->sp = env->xregs[31];
+        event->fp = env->xregs[29];
+        event->host_us = g_get_monotonic_time();
+        event->cpu = cs->cpu_index;
+
+        ipa10_restart_event_head =
+            (ipa10_restart_event_head + 1) % IPA10_RESTART_EVENT_CAPACITY;
+        if (ipa10_restart_event_count < IPA10_RESTART_EVENT_CAPACITY) {
+            ipa10_restart_event_count++;
+        } else {
+            ipa10_restart_event_overwritten++;
+        }
+    }
+    qemu_mutex_unlock(&ipa10_restart_event_lock);
+}
+
+void arm_ipa10_flush_restart_events(CPUARMState *env)
+{
+    IPA10RestartEvent snapshot[IPA10_RESTART_EVENT_CAPACITY];
+    unsigned count;
+    unsigned oldest;
+    uint64_t total;
+    uint64_t overwritten;
+    CPUState *cs = env_cpu(env);
+
+    ipa10_restart_event_lock_init();
+    qemu_mutex_lock(&ipa10_restart_event_lock);
+    if (ipa10_restart_events_frozen) {
+        qemu_mutex_unlock(&ipa10_restart_event_lock);
+        return;
+    }
+    ipa10_restart_events_frozen = true;
+    count = ipa10_restart_event_count;
+    total = ipa10_restart_event_total;
+    overwritten = ipa10_restart_event_overwritten;
+    oldest = (ipa10_restart_event_head + IPA10_RESTART_EVENT_CAPACITY -
+              count) % IPA10_RESTART_EVENT_CAPACITY;
+    for (unsigned i = 0; i < count; i++) {
+        snapshot[i] =
+            ipa10_restart_events[(oldest + i) % IPA10_RESTART_EVENT_CAPACITY];
+    }
+    qemu_mutex_unlock(&ipa10_restart_event_lock);
+
+    error_report("IPA10_CALLER_FLUSH reason=psci_system_reset"
+                 " reset_host_us=%" PRId64 " reset_cpu=%d reset_pc=0x%016"
+                 PRIx64 " total=%" PRIu64 " retained=%u overwritten=%"
+                 PRIu64,
+                 (int64_t)g_get_monotonic_time(), cs->cpu_index, env->pc,
+                 total, count, overwritten);
+    for (unsigned i = 0; i < count; i++) {
+        const IPA10RestartEvent *event = &snapshot[i];
+
+        error_report("IPA10_CALLER_ENTRY event=%" PRIu64
+                     " order=serialized_capture cpu=%d pc=0x%016" PRIx64
+                     " bl_target=0x%016" PRIx64
+                     " x0_raw=0x%016" PRIx64 " x1_raw=0x%016" PRIx64
+                     " lr_raw=0x%016" PRIx64 " bl_return_lr=0x%016" PRIx64
+                     " sp=0x%016" PRIx64 " fp=0x%016" PRIx64
+                     " host_us=%" PRId64,
+                     event->event, event->cpu, event->pc, event->target_pc,
+                     event->x0, event->x1, event->lr, event->pc + 4,
+                     event->sp, event->fp, event->host_us);
+    }
+}
 
 void HELPER(ipa9_pe_entry_observer)(CPUARMState *env, uint64_t pc)
 {
