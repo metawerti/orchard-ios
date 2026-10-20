@@ -46,6 +46,8 @@ static uint32_t ipa9_halt_signature_logged;
 static uint32_t ipa10_restart_call_signature_translations;
 static uint32_t ipa11_ready_logged;
 static uint32_t ipa11_blraa_signature_translations;
+static uint32_t ipa12_ready_logged;
+static uint32_t ipa12_blraa_signature_translations;
 
 static const char *regnames[] = {
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
@@ -11302,6 +11304,16 @@ static const uint32_t ipa11_blraa_masks[IPA11_BLRAA_SIGNATURE_WORDS] = {
     0xffffffff, 0xffffffff, 0xffffffff,
     0xffffffff, 0xffffffff, 0xffffffff,
 };
+static void aarch64_ipa12_emit_sys55_filter(DisasContext *s, uint64_t pc)
+{
+    TCGv_i64 selector = read_cpu_reg(s, 19, 0);
+    TCGLabel *not_syscall55 = gen_new_label();
+
+    tcg_gen_brcondi_i64(TCG_COND_NE, selector, 55, not_syscall55);
+    gen_helper_ipa12_sys55_observer(tcg_env, tcg_constant_i64(pc));
+    gen_set_label(not_syscall55);
+}
+
 
 static void aarch64_ipa11_match_blraa(DisasContext *s, uint64_t pc,
                                       uint32_t insn, bool block_ending,
@@ -11335,6 +11347,7 @@ static void aarch64_ipa11_match_blraa(DisasContext *s, uint64_t pc,
             s->base.insn_start != NULL && tcg_ctx->emit_before_op == NULL) {
             tcg_ctx->emit_before_op = s->base.insn_start;
             gen_helper_ipa11_blraa_observer(tcg_env, tcg_constant_i64(pc));
+            aarch64_ipa12_emit_sys55_filter(s, pc);
             tcg_ctx->emit_before_op = NULL;
 
             uint32_t translation =
@@ -11344,6 +11357,17 @@ static void aarch64_ipa11_match_blraa(DisasContext *s, uint64_t pc,
                              " translation=%u translation_cpu=%d"
                              " signature_start_pc=0x%016" PRIx64
                              " blraa_pc=0x%016" PRIx64,
+                             translation, cpu->cpu_index,
+                             (uint64_t)s->ipa11_blraa_pc, pc);
+            }
+            translation =
+                qatomic_fetch_inc(&ipa12_blraa_signature_translations) + 1;
+            if (translation <= 8) {
+                error_report("IPA12_SYS55_SIG_TRANSLATED"
+                             " translation=%u translation_cpu=%d"
+                             " signature_start_pc=0x%016" PRIx64
+                             " blraa_pc=0x%016" PRIx64
+                             " runtime_selector_filter=55",
                              translation, cpu->cpu_index,
                              (uint64_t)s->ipa11_blraa_pc, pc);
             }
@@ -11497,6 +11521,11 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     if (qatomic_cmpxchg(&ipa11_ready_logged, 0, 1) == 0) {
         error_report("IPA11_READY observer=arm64_tcg cpu=%d first_pc=0x%016"
                      PRIx64,
+                     cpu->cpu_index, pc);
+    }
+    if (qatomic_cmpxchg(&ipa12_ready_logged, 0, 1) == 0) {
+        error_report("IPA12_READY observer=selector55_blraa cpu=%d"
+                     " first_pc=0x%016" PRIx64,
                      cpu->cpu_index, pc);
     }
 

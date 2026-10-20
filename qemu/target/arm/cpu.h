@@ -1382,6 +1382,9 @@ void arm_emulate_firmware_reset(CPUState *cpustate, int target_el);
 void arm_ipa9_log_reset_summary(CPUARMState *env);
 void arm_ipa10_flush_restart_events(CPUARMState *env);
 void arm_ipa11_flush_blraa_events(CPUARMState *env);
+void arm_ipa12_snapshot_on_ipa10(CPUARMState *env, uint64_t pc,
+                                 uint64_t caller_event);
+void arm_ipa12_flush_sys55_events(CPUARMState *env);
 #endif
 
 int aarch64_cpu_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg);

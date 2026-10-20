@@ -55,6 +55,7 @@
 #define IPA9_RESET_SUMMARY_LOG_LIMIT 8
 #define IPA10_RESTART_EVENT_CAPACITY 32
 #define IPA11_BLRAA_EVENT_CAPACITY 32
+#define IPA12_SYS55_TAIL_CAPACITY 32
 
 static uint64_t ipa9_entry_event_sequence;
 static uint64_t ipa9_pe_entry_count;
@@ -77,6 +78,33 @@ typedef struct IPA11BlraaEvent {
     int cpu;
 } IPA11BlraaEvent;
 
+typedef struct IPA12Sys55Event {
+    uint64_t event;
+    uint64_t pc;
+    uint64_t x0;
+    uint64_t x1;
+    uint64_t x2;
+    uint64_t x8_raw;
+    uint64_t x17_modifier;
+    uint64_t lr_raw;
+    uint64_t sp;
+    uint64_t fp;
+    int64_t host_us;
+    uint32_t selector;
+    int cpu;
+} IPA12Sys55Event;
+
+typedef struct IPA12Sys55Snapshot {
+    IPA12Sys55Event first;
+    IPA12Sys55Event tail[IPA12_SYS55_TAIL_CAPACITY];
+    unsigned tail_count;
+    bool first_valid;
+    bool first_in_tail;
+    uint64_t captured;
+    uint64_t tail_overwritten;
+} IPA12Sys55Snapshot;
+
+
 static QemuMutex ipa11_blraa_event_lock;
 static gsize ipa11_blraa_event_lock_initialized;
 static IPA11BlraaEvent ipa11_blraa_events[IPA11_BLRAA_EVENT_CAPACITY];
@@ -85,6 +113,17 @@ static unsigned ipa11_blraa_event_count;
 static uint64_t ipa11_blraa_event_captured;
 static uint64_t ipa11_blraa_event_overwritten;
 static bool ipa11_blraa_events_frozen;
+static QemuMutex ipa12_sys55_event_lock;
+static gsize ipa12_sys55_event_lock_initialized;
+static IPA12Sys55Event ipa12_sys55_first_event;
+static bool ipa12_sys55_first_valid;
+static IPA12Sys55Event ipa12_sys55_tail[IPA12_SYS55_TAIL_CAPACITY];
+static unsigned ipa12_sys55_tail_head;
+static unsigned ipa12_sys55_tail_count;
+static uint64_t ipa12_sys55_captured;
+static uint64_t ipa12_sys55_tail_overwritten;
+static bool ipa12_sys55_caller_snapshot_done;
+static bool ipa12_sys55_frozen;
 
 static void ipa11_blraa_event_lock_init(void)
 {
@@ -93,6 +132,14 @@ static void ipa11_blraa_event_lock_init(void)
         g_once_init_leave(&ipa11_blraa_event_lock_initialized, 1);
     }
 }
+static void ipa12_sys55_event_lock_init(void)
+{
+    if (g_once_init_enter(&ipa12_sys55_event_lock_initialized)) {
+        qemu_mutex_init(&ipa12_sys55_event_lock);
+        g_once_init_leave(&ipa12_sys55_event_lock_initialized, 1);
+    }
+}
+
 
 typedef struct IPA10RestartEvent {
     uint64_t event;
@@ -129,6 +176,7 @@ void HELPER(ipa10_restart_callsite_observer)(CPUARMState *env, uint64_t pc,
                                               uint64_t target_pc)
 {
     CPUState *cs = env_cpu(env);
+    uint64_t caller_event = 0;
 
     ipa10_restart_event_lock_init();
     qemu_mutex_lock(&ipa10_restart_event_lock);
@@ -137,6 +185,7 @@ void HELPER(ipa10_restart_callsite_observer)(CPUARMState *env, uint64_t pc,
             &ipa10_restart_events[ipa10_restart_event_head];
 
         event->event = ++ipa10_restart_event_total;
+        caller_event = event->event;
         event->pc = pc;
         event->target_pc = target_pc;
         event->x0 = env->xregs[0];
@@ -156,6 +205,7 @@ void HELPER(ipa10_restart_callsite_observer)(CPUARMState *env, uint64_t pc,
         }
     }
     qemu_mutex_unlock(&ipa10_restart_event_lock);
+    arm_ipa12_snapshot_on_ipa10(env, pc, caller_event);
 }
 
 void arm_ipa10_flush_restart_events(CPUARMState *env)
@@ -291,6 +341,175 @@ void arm_ipa11_flush_blraa_events(CPUARMState *env)
                      event->x17_modifier, event->x0, event->x1, event->x2,
                      event->lr_raw, event->pc + 4, event->sp, event->fp);
     }
+}
+
+
+static void ipa12_sys55_snapshot_locked(IPA12Sys55Snapshot *snapshot)
+{
+    unsigned oldest =
+        (ipa12_sys55_tail_head + IPA12_SYS55_TAIL_CAPACITY -
+         ipa12_sys55_tail_count) % IPA12_SYS55_TAIL_CAPACITY;
+
+    snapshot->captured = ipa12_sys55_captured;
+    snapshot->tail_overwritten = ipa12_sys55_tail_overwritten;
+    snapshot->tail_count = ipa12_sys55_tail_count;
+    snapshot->first_valid = ipa12_sys55_first_valid;
+    snapshot->first_in_tail = false;
+    if (snapshot->first_valid) {
+        snapshot->first = ipa12_sys55_first_event;
+    }
+    for (unsigned i = 0; i < ipa12_sys55_tail_count; i++) {
+        snapshot->tail[i] =
+            ipa12_sys55_tail[(oldest + i) % IPA12_SYS55_TAIL_CAPACITY];
+        if (snapshot->first_valid &&
+            snapshot->tail[i].event == snapshot->first.event) {
+            snapshot->first_in_tail = true;
+        }
+    }
+}
+
+static void ipa12_sys55_report_event(const IPA12Sys55Event *event,
+                                     const char *snapshot,
+                                     const char *record)
+{
+    error_report("IPA12_SYS55_ENTRY snapshot=%s record=%s"
+                 " event=%" PRIu64 " host_us=%" PRId64 " cpu=%d"
+                 " state=pre_blraa pc=0x%016" PRIx64
+                 " selector=%" PRIu32 " x8_raw=0x%016" PRIx64
+                 " x17_modifier=0x%016" PRIx64
+                 " x0=0x%016" PRIx64 " x1=0x%016" PRIx64
+                 " x2=0x%016" PRIx64 " lr_raw=0x%016" PRIx64
+                 " branch_return_pc=0x%016" PRIx64
+                 " sp=0x%016" PRIx64 " fp=0x%016" PRIx64,
+                 snapshot, record, event->event, event->host_us, event->cpu,
+                 event->pc, event->selector, event->x8_raw,
+                 event->x17_modifier, event->x0, event->x1, event->x2,
+                 event->lr_raw, event->pc + 4, event->sp, event->fp);
+}
+
+static void ipa12_sys55_report_snapshot(const IPA12Sys55Snapshot *snapshot,
+                                        const char *marker,
+                                        const char *reason,
+                                        int trigger_cpu,
+                                        uint64_t trigger_pc,
+                                        uint64_t trigger_event)
+{
+    unsigned retained = snapshot->tail_count +
+                        (snapshot->first_valid && !snapshot->first_in_tail);
+
+    error_report("%s reason=%s host_us=%" PRId64
+                 " trigger_cpu=%d trigger_pc=0x%016" PRIx64
+                 " trigger_event=%" PRIu64 " captured=%" PRIu64
+                 " retained=%u first_retained=%u tail_retained=%u"
+                 " tail_overwritten=%" PRIu64 " event_watermark=%" PRIu64,
+                 marker, reason, (int64_t)g_get_monotonic_time(),
+                 trigger_cpu, trigger_pc, trigger_event, snapshot->captured,
+                 retained, snapshot->first_valid, snapshot->tail_count,
+                 snapshot->tail_overwritten, snapshot->captured);
+
+    if (snapshot->first_valid) {
+        ipa12_sys55_report_event(&snapshot->first, reason, "first");
+    }
+    for (unsigned i = 0; i < snapshot->tail_count; i++) {
+        const IPA12Sys55Event *event = &snapshot->tail[i];
+
+        if (snapshot->first_valid &&
+            event->event == snapshot->first.event) {
+            continue;
+        }
+        ipa12_sys55_report_event(event, reason, "tail");
+    }
+}
+
+void HELPER(ipa12_sys55_observer)(CPUARMState *env, uint64_t pc)
+{
+    uint32_t selector = (uint32_t)env->xregs[19];
+    CPUState *cs = env_cpu(env);
+
+    /* The translator filters all other W19 values before calling this. */
+    if (selector != 55) {
+        return;
+    }
+
+    ipa12_sys55_event_lock_init();
+    qemu_mutex_lock(&ipa12_sys55_event_lock);
+    if (!ipa12_sys55_frozen) {
+        IPA12Sys55Event event = {
+            .event = ++ipa12_sys55_captured,
+            .pc = pc,
+            .x0 = env->xregs[0],
+            .x1 = env->xregs[1],
+            .x2 = env->xregs[2],
+            .x8_raw = env->xregs[8],
+            .x17_modifier = env->xregs[17],
+            .lr_raw = env->xregs[30],
+            .sp = env->xregs[31],
+            .fp = env->xregs[29],
+            .host_us = g_get_monotonic_time(),
+            .selector = selector,
+            .cpu = cs->cpu_index,
+        };
+
+        if (!ipa12_sys55_first_valid) {
+            ipa12_sys55_first_event = event;
+            ipa12_sys55_first_valid = true;
+        }
+        ipa12_sys55_tail[ipa12_sys55_tail_head] = event;
+        ipa12_sys55_tail_head =
+            (ipa12_sys55_tail_head + 1) % IPA12_SYS55_TAIL_CAPACITY;
+        if (ipa12_sys55_tail_count < IPA12_SYS55_TAIL_CAPACITY) {
+            ipa12_sys55_tail_count++;
+        } else {
+            ipa12_sys55_tail_overwritten++;
+        }
+    }
+    qemu_mutex_unlock(&ipa12_sys55_event_lock);
+}
+
+void arm_ipa12_snapshot_on_ipa10(CPUARMState *env, uint64_t pc,
+                                 uint64_t caller_event)
+{
+    /* IPA10 serializes caller ids before releasing its own event lock. */
+    if (caller_event != 1) {
+        return;
+    }
+
+    IPA12Sys55Snapshot snapshot = { 0 };
+    CPUState *cs = env_cpu(env);
+
+    ipa12_sys55_event_lock_init();
+    qemu_mutex_lock(&ipa12_sys55_event_lock);
+    if (ipa12_sys55_frozen || ipa12_sys55_caller_snapshot_done) {
+        qemu_mutex_unlock(&ipa12_sys55_event_lock);
+        return;
+    }
+    ipa12_sys55_caller_snapshot_done = true;
+    ipa12_sys55_snapshot_locked(&snapshot);
+    qemu_mutex_unlock(&ipa12_sys55_event_lock);
+
+    ipa12_sys55_report_snapshot(&snapshot, "IPA12_SYS55_SNAPSHOT",
+                                "ipa10_caller_first", cs->cpu_index, pc,
+                                caller_event);
+}
+
+void arm_ipa12_flush_sys55_events(CPUARMState *env)
+{
+    IPA12Sys55Snapshot snapshot = { 0 };
+    CPUState *cs = env_cpu(env);
+
+    ipa12_sys55_event_lock_init();
+    qemu_mutex_lock(&ipa12_sys55_event_lock);
+    if (ipa12_sys55_frozen) {
+        qemu_mutex_unlock(&ipa12_sys55_event_lock);
+        return;
+    }
+    ipa12_sys55_frozen = true;
+    ipa12_sys55_snapshot_locked(&snapshot);
+    qemu_mutex_unlock(&ipa12_sys55_event_lock);
+
+    ipa12_sys55_report_snapshot(&snapshot, "IPA12_SYS55_FLUSH",
+                                "psci_system_reset", cs->cpu_index, env->pc,
+                                0);
 }
 
 void HELPER(ipa9_pe_entry_observer)(CPUARMState *env, uint64_t pc)
