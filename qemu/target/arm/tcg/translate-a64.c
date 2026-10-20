@@ -44,6 +44,8 @@ static uint32_t ipa9_ready_logged;
 static uint32_t ipa9_pe_signature_logged;
 static uint32_t ipa9_halt_signature_logged;
 static uint32_t ipa10_restart_call_signature_translations;
+static uint32_t ipa11_ready_logged;
+static uint32_t ipa11_blraa_signature_translations;
 
 static const char *regnames[] = {
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
@@ -11046,6 +11048,8 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->ipa9_halt_entry_start = NULL;
     dc->ipa10_restart_call_match = 0;
     dc->ipa10_restart_call_pc = 0;
+    dc->ipa11_blraa_match = 0;
+    dc->ipa11_blraa_pc = 0;
     dc->condjmp = 0;
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = true;
@@ -11278,6 +11282,80 @@ static void aarch64_ipa10_match_restart_call(DisasContext *s, uint64_t pc,
     s->ipa10_restart_call_match++;
 }
 
+#define IPA11_BLRAA_SIGNATURE_WORDS 6
+
+/*
+ * Exact six-word Ventura 22G120 dispatcher signature. The reference call is
+ * at 0xfffffe0008165b44, but runtime matching is entirely instruction-based.
+ * The final BLRAA is a terminal DISAS_JUMP and is matched only after decode.
+ */
+static const uint32_t ipa11_blraa_signature[IPA11_BLRAA_SIGNATURE_WORDS] = {
+    0xf94002e8, /* ldr x8, [x23] */
+    0xaa1603e0, /* mov x0, x22 */
+    0xaa1403e1, /* mov x1, x20 */
+    0xaa1a03e2, /* mov x2, x26 */
+    0xd29795b1, /* movz x17, #0xbcad */
+    0xd73f0911, /* blraa x8, x17 */
+};
+
+static const uint32_t ipa11_blraa_masks[IPA11_BLRAA_SIGNATURE_WORDS] = {
+    0xffffffff, 0xffffffff, 0xffffffff,
+    0xffffffff, 0xffffffff, 0xffffffff,
+};
+
+static void aarch64_ipa11_match_blraa(DisasContext *s, uint64_t pc,
+                                      uint32_t insn, bool block_ending,
+                                      bool terminal_blraa, CPUState *cpu)
+{
+    unsigned next = s->ipa11_blraa_match;
+
+    if (next != 0 &&
+        (pc != s->ipa11_blraa_pc + (uint64_t)next * 4 ||
+         (insn & ipa11_blraa_masks[next]) !=
+             (ipa11_blraa_signature[next] & ipa11_blraa_masks[next]) ||
+         block_ending != (next == IPA11_BLRAA_SIGNATURE_WORDS - 1) ||
+         (next == IPA11_BLRAA_SIGNATURE_WORDS - 1 && !terminal_blraa))) {
+        s->ipa11_blraa_match = 0;
+        s->ipa11_blraa_pc = 0;
+        next = 0;
+    }
+
+    if (next == 0) {
+        if (block_ending ||
+            (insn & ipa11_blraa_masks[0]) != ipa11_blraa_signature[0]) {
+            return;
+        }
+        s->ipa11_blraa_match = 1;
+        s->ipa11_blraa_pc = pc;
+        return;
+    }
+
+    if (next == IPA11_BLRAA_SIGNATURE_WORDS - 1) {
+        if (block_ending && terminal_blraa &&
+            s->base.insn_start != NULL && tcg_ctx->emit_before_op == NULL) {
+            tcg_ctx->emit_before_op = s->base.insn_start;
+            gen_helper_ipa11_blraa_observer(tcg_env, tcg_constant_i64(pc));
+            tcg_ctx->emit_before_op = NULL;
+
+            uint32_t translation =
+                qatomic_fetch_inc(&ipa11_blraa_signature_translations) + 1;
+            if (translation <= 8) {
+                error_report("IPA11_BLRAA_SIG_TRANSLATED"
+                             " translation=%u translation_cpu=%d"
+                             " signature_start_pc=0x%016" PRIx64
+                             " blraa_pc=0x%016" PRIx64,
+                             translation, cpu->cpu_index,
+                             s->ipa11_blraa_pc, pc);
+            }
+        }
+        s->ipa11_blraa_match = 0;
+        s->ipa11_blraa_pc = 0;
+        return;
+    }
+
+    s->ipa11_blraa_match++;
+}
+
 static void aarch64_ipa9_match_pe(DisasContext *s, uint64_t pc,
                                   uint32_t insn, bool block_ending,
                                   CPUState *cpu)
@@ -11416,6 +11494,12 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     uint32_t insn;
     bool decoded;
 
+    if (qatomic_cmpxchg(&ipa11_ready_logged, 0, 1) == 0) {
+        error_report("IPA11_READY observer=arm64_tcg cpu=%d first_pc=0x%016"
+                     PRIx64,
+                     cpu->cpu_index, pc);
+    }
+
     /* Singlestep exceptions have the highest priority. */
     if (s->ss_active && !s->pstate_ss) {
         /* Singlestep state is Active-pending.
@@ -11510,6 +11594,11 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         aarch64_ipa9_match_pe(s, pc, insn, block_ending, cpu);
         aarch64_ipa9_match_halt(s, pc, insn, block_ending, cpu);
         aarch64_ipa10_match_restart_call(s, pc, insn, block_ending, cpu);
+        aarch64_ipa11_match_blraa(s, pc, insn, block_ending, false, cpu);
+    } else if (decoded && s->base.is_jmp == DISAS_JUMP &&
+               insn == 0xd73f0911) {
+        /* Only the exact, successfully decoded terminal BLRAA can finish it. */
+        aarch64_ipa11_match_blraa(s, pc, insn, true, true, cpu);
     }
 
     /*

@@ -48,6 +48,9 @@ typedef struct DisasContext {
     /* IPA10 upstream restart-call signature; never spans translation blocks. */
     unsigned ipa10_restart_call_match;
     vaddr ipa10_restart_call_pc;
+    /* IPA11 authenticated callback signature; TB-local and fail-closed. */
+    unsigned ipa11_blraa_match;
+    vaddr ipa11_blraa_pc;
     const ARMISARegisters *isar;
     DisasDelayException *delay_excp_list;
 

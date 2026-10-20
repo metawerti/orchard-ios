@@ -54,11 +54,45 @@
 #define IPA9_ENTRY_LOG_LIMIT 32
 #define IPA9_RESET_SUMMARY_LOG_LIMIT 8
 #define IPA10_RESTART_EVENT_CAPACITY 32
+#define IPA11_BLRAA_EVENT_CAPACITY 32
 
 static uint64_t ipa9_entry_event_sequence;
 static uint64_t ipa9_pe_entry_count;
 static uint64_t ipa9_halt_entry_count;
 static uint64_t ipa9_reset_summary_count;
+
+typedef struct IPA11BlraaEvent {
+    uint64_t event;
+    uint64_t pc;
+    uint64_t x0;
+    uint64_t x1;
+    uint64_t x2;
+    uint64_t x8_raw;
+    uint64_t x17_modifier;
+    uint64_t lr_raw;
+    uint64_t sp;
+    uint64_t fp;
+    int64_t host_us;
+    uint32_t w19_selector;
+    int cpu;
+} IPA11BlraaEvent;
+
+static QemuMutex ipa11_blraa_event_lock;
+static gsize ipa11_blraa_event_lock_initialized;
+static IPA11BlraaEvent ipa11_blraa_events[IPA11_BLRAA_EVENT_CAPACITY];
+static unsigned ipa11_blraa_event_head;
+static unsigned ipa11_blraa_event_count;
+static uint64_t ipa11_blraa_event_captured;
+static uint64_t ipa11_blraa_event_overwritten;
+static bool ipa11_blraa_events_frozen;
+
+static void ipa11_blraa_event_lock_init(void)
+{
+    if (g_once_init_enter(&ipa11_blraa_event_lock_initialized)) {
+        qemu_mutex_init(&ipa11_blraa_event_lock);
+        g_once_init_leave(&ipa11_blraa_event_lock_initialized, 1);
+    }
+}
 
 typedef struct IPA10RestartEvent {
     uint64_t event;
@@ -170,6 +204,92 @@ void arm_ipa10_flush_restart_events(CPUARMState *env)
                      event->event, event->cpu, event->pc, event->target_pc,
                      event->x0, event->x1, event->lr, event->pc + 4,
                      event->sp, event->fp, event->host_us);
+    }
+}
+
+void HELPER(ipa11_blraa_observer)(CPUARMState *env, uint64_t pc)
+{
+    CPUState *cs = env_cpu(env);
+
+    ipa11_blraa_event_lock_init();
+    qemu_mutex_lock(&ipa11_blraa_event_lock);
+    if (!ipa11_blraa_events_frozen) {
+        IPA11BlraaEvent *event =
+            &ipa11_blraa_events[ipa11_blraa_event_head];
+
+        event->event = ++ipa11_blraa_event_captured;
+        event->pc = pc;
+        event->x0 = env->xregs[0];
+        event->x1 = env->xregs[1];
+        event->x2 = env->xregs[2];
+        event->w19_selector = (uint32_t)env->xregs[19];
+        event->x8_raw = env->xregs[8];
+        event->x17_modifier = env->xregs[17];
+        event->lr_raw = env->xregs[30];
+        event->sp = env->xregs[31];
+        event->fp = env->xregs[29];
+        event->host_us = g_get_monotonic_time();
+        event->cpu = cs->cpu_index;
+
+        ipa11_blraa_event_head =
+            (ipa11_blraa_event_head + 1) % IPA11_BLRAA_EVENT_CAPACITY;
+        if (ipa11_blraa_event_count < IPA11_BLRAA_EVENT_CAPACITY) {
+            ipa11_blraa_event_count++;
+        } else {
+            ipa11_blraa_event_overwritten++;
+        }
+    }
+    qemu_mutex_unlock(&ipa11_blraa_event_lock);
+}
+
+void arm_ipa11_flush_blraa_events(CPUARMState *env)
+{
+    IPA11BlraaEvent snapshot[IPA11_BLRAA_EVENT_CAPACITY];
+    unsigned count;
+    unsigned oldest;
+    uint64_t captured;
+    uint64_t overwritten;
+    CPUState *cs = env_cpu(env);
+
+    ipa11_blraa_event_lock_init();
+    qemu_mutex_lock(&ipa11_blraa_event_lock);
+    if (ipa11_blraa_events_frozen) {
+        qemu_mutex_unlock(&ipa11_blraa_event_lock);
+        return;
+    }
+    ipa11_blraa_events_frozen = true;
+    count = ipa11_blraa_event_count;
+    captured = ipa11_blraa_event_captured;
+    overwritten = ipa11_blraa_event_overwritten;
+    oldest = (ipa11_blraa_event_head + IPA11_BLRAA_EVENT_CAPACITY - count) %
+             IPA11_BLRAA_EVENT_CAPACITY;
+    for (unsigned i = 0; i < count; i++) {
+        snapshot[i] =
+            ipa11_blraa_events[(oldest + i) % IPA11_BLRAA_EVENT_CAPACITY];
+    }
+    qemu_mutex_unlock(&ipa11_blraa_event_lock);
+
+    error_report("IPA11_BLRAA_FLUSH reason=psci_system_reset"
+                 " reset_host_us=%" PRId64 " reset_cpu=%d reset_pc=0x%016"
+                 PRIx64 " captured=%" PRIu64 " retained=%u overwritten=%"
+                 PRIu64,
+                 (int64_t)g_get_monotonic_time(), cs->cpu_index, env->pc,
+                 captured, count, overwritten);
+    for (unsigned i = 0; i < count; i++) {
+        const IPA11BlraaEvent *event = &snapshot[i];
+
+        error_report("IPA11_BLRAA_ENTRY event=%" PRIu64
+                     " host_us=%" PRId64 " cpu=%d state=pre_blraa"
+                     " pc=0x%016" PRIx64 " w19_selector=0x%08" PRIx32
+                     " x8_raw=0x%016" PRIx64 " x17_modifier=0x%016" PRIx64
+                     " x0=0x%016" PRIx64 " x1=0x%016" PRIx64
+                     " x2=0x%016" PRIx64 " lr_raw=0x%016" PRIx64
+                     " branch_return_pc=0x%016" PRIx64
+                     " sp=0x%016" PRIx64 " fp=0x%016" PRIx64,
+                     event->event, event->host_us, event->cpu, event->pc,
+                     event->w19_selector, event->x8_raw,
+                     event->x17_modifier, event->x0, event->x1, event->x2,
+                     event->lr_raw, event->pc + 4, event->sp, event->fp);
     }
 }
 

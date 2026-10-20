@@ -1,0 +1,164 @@
+name: Orchard IPA11 Authenticated Callback
+
+on:
+  push:
+    branches:
+      - ipa11-authenticated-callback
+
+jobs:
+  build:
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout exact IPA11 branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install existing iOS build toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install existing pipeline build tools
+        run: brew install ninja pkgconf glib pixman libslirp qemu
+
+      - name: Fetch existing iOS dependencies
+        run: scripts/fetch-ios-deps.sh
+
+      - name: Build and verify IPA11 QEMU dylib
+        run: |
+          set -euo pipefail
+          scripts/build-ios.sh 2>&1 | tee ipa11-qemu-build.log
+
+          src=qemu/target/arm/tcg/translate-a64.c
+          helper=qemu/target/arm/tcg/helper-a64.c
+          psci=qemu/target/arm/tcg/psci.c
+          lib=qemu/build-ios/libqemu-aarch64-softmmu.dylib
+          base=6eb4e895440a0151565e667eee06f42a63d96428
+
+          git diff --check "$base" HEAD
+          git diff "$base" HEAD -- \
+            qemu/target/arm/tcg/translate-a64.c \
+            qemu/target/arm/tcg/translate.h \
+            qemu/target/arm/tcg/helper-a64-defs.h \
+            qemu/target/arm/tcg/helper-a64.c \
+            qemu/target/arm/cpu.h \
+            qemu/target/arm/tcg/psci.c \
+            .github/workflows/ipa11-authenticated-callback.yml \
+            > ipa11-source-diff.patch
+
+          grep -F 'IPA11_BLRAA_SIGNATURE_WORDS 6' "$src"
+          grep -F '0xf94002e8' "$src"
+          grep -F '0xaa1603e0' "$src"
+          grep -F '0xaa1403e1' "$src"
+          grep -F '0xaa1a03e2' "$src"
+          grep -F '0xd29795b1' "$src"
+          grep -F '0xd73f0911' "$src"
+          grep -F 'IPA10_RESTART_CALL_SIGNATURE_WORDS 4' "$src"
+          grep -F 'IPA9_PE_SIGNATURE_WORDS 3' "$src"
+          grep -F 'IPA9_HALT_SIGNATURE_WORDS 12' "$src"
+          grep -F 'IPA11_BLRAA_EVENT_CAPACITY 32' "$helper"
+          grep -F 'IPA9_RESET_SUMMARY_LOG_LIMIT 8' "$helper"
+          grep -F 'arm_ipa9_log_reset_summary(env)' "$psci"
+          grep -F 'arm_ipa10_flush_restart_events(env)' "$psci"
+          grep -F 'arm_ipa11_flush_blraa_events(env)' "$psci"
+          grep -F 'qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET)' "$psci"
+
+          strings "$lib" > ipa11-dylib-strings.txt
+          for marker in 'IPA11_READY observer=arm64_tcg' \
+                        'IPA11_BLRAA_SIG_TRANSLATED' \
+                        'IPA11_BLRAA_ENTRY event=' \
+                        'IPA11_BLRAA_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_ENTRY event=' \
+                        'IPA10_CALLER_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_SIG_TRANSLATED' \
+                        'IPA9_READY ' 'IPA9_%s_SIG_TRANSLATED ' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_FRAME ' 'MACPAD_RESET_CODE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa11-dylib-strings.txt
+          done
+
+          nm -a "$lib" > ipa11-dylib-symbols.txt
+          grep -E 'helper_ipa11_blraa_observer|arm_ipa11_flush_blraa_events' ipa11-dylib-symbols.txt
+          grep -E 'helper_ipa10_restart_callsite_observer|arm_ipa10_flush_restart_events' ipa11-dylib-symbols.txt
+          grep -E 'helper_ipa9_pe_entry_observer|helper_ipa9_halt_entry_observer|arm_ipa9_log_reset_summary' ipa11-dylib-symbols.txt
+
+          vtool -show-build-version "$lib" | tee ipa11-dylib-platform.txt
+          shasum -a 256 "$lib" > ipa11-dylib.sha256
+          git rev-parse HEAD > ipa11-commit.txt
+          printf '%s\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > ipa11-workflow-run.txt
+          cp qemu/build-ios.cross.txt ipa11-cross.txt
+          cp qemu/build-ios/compile_commands.json ipa11-compile-commands.json
+
+      - name: Build IPA and verify packaged QEMU
+        env:
+          ORCHARD_NO_ICON: "1"
+          ORCHARD_NO_NSIO: "1"
+        run: |
+          set -euo pipefail
+          ios/app/build.sh 2>&1 | tee ipa11-app-build.log
+
+          ipa=ios/app/IPA11.ipa
+          test -s ios/app/Orchard.ipa
+          test ! -e "$ipa"
+          mv ios/app/Orchard.ipa "$ipa"
+
+          unzip -t "$ipa" | tee ipa11-ipa-integrity.txt
+          mkdir ipa11-verify
+          unzip -q "$ipa" -d ipa11-verify
+          app=ipa11-verify/Payload/Orchard.app
+          bundled="$app/Frameworks/libqemu-aarch64-softmmu.dylib"
+          test -s "$app/Info.plist"
+          test -s "$app/Orchard"
+          test -s "$bundled"
+          plutil -extract CFBundleIdentifier raw -o - "$app/Info.plist" | tee ipa11-bundle-id.txt
+
+          if cmp -s qemu/build-ios/libqemu-aarch64-softmmu.dylib "$bundled"; then
+            printf 'packaged dylib is byte-for-byte identical\n' > ipa11-package-compare.txt
+          else
+            printf 'packaged dylib differs bytewise; required markers checked below\n' > ipa11-package-compare.txt
+          fi
+
+          strings "$bundled" > ipa11-packaged-strings.txt
+          for marker in 'IPA11_READY observer=arm64_tcg' \
+                        'IPA11_BLRAA_SIG_TRANSLATED' \
+                        'IPA11_BLRAA_ENTRY event=' \
+                        'IPA11_BLRAA_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_ENTRY event=' \
+                        'IPA10_CALLER_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_SIG_TRANSLATED' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa11-packaged-strings.txt
+          done
+
+          file "$bundled" | tee ipa11-packaged-dylib-file.txt
+          lipo -archs "$bundled" | tee ipa11-packaged-dylib-arches.txt
+          grep -F arm64 ipa11-packaged-dylib-arches.txt
+          shasum -a 256 "$bundled" > ipa11-packaged-dylib.sha256
+          shasum -a 256 "$ipa" > ipa11-ipa.sha256
+          stat -f 'ipa_size_bytes=%z' "$ipa" > ipa11-ipa-size.txt
+          test -s "$ipa"
+
+      - name: Upload IPA11 artifact and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPA11
+          path: |
+            ios/app/IPA11.ipa
+            ipa11-*.log
+            ipa11-*.txt
+            ipa11-*.patch
+            ipa11-*.json
+            ipa11-*.sha256
+          if-no-files-found: error
