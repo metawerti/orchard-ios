@@ -1,0 +1,187 @@
+name: Orchard IPA12 Selector-55 Recorder
+
+on:
+  push:
+    branches:
+      - ipa12-selector55
+
+jobs:
+  build:
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout isolated IPA12 branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install existing iOS build toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install existing pipeline build tools
+        run: brew install ninja pkgconf glib pixman libslirp qemu
+
+      - name: Fetch existing iOS dependencies
+        run: scripts/fetch-ios-deps.sh
+
+      - name: Build and verify IPA12 QEMU dylib
+        run: |
+          set -euo pipefail
+
+          source_commit=3735aac607a55e7a8ac50a4c8392651a0fbeff6c
+          base_commit=bc9b48b7b48324af8ce12671341fc1c83292a230
+          test "$(git rev-parse HEAD^)" = "$source_commit"
+          test "$(git rev-parse "$source_commit^")" = "$base_commit"
+          test "$(git diff --name-only "$source_commit" HEAD)" = ".github/workflows/ipa12-selector55.yml"
+          test "$GITHUB_REF_NAME" = "ipa12-selector55"
+
+          git diff --check "$base_commit" "$source_commit"
+          git diff "$base_commit" "$source_commit" -- \
+            qemu/target/arm/cpu.h \
+            qemu/target/arm/tcg/helper-a64-defs.h \
+            qemu/target/arm/tcg/helper-a64.c \
+            qemu/target/arm/tcg/psci.c \
+            qemu/target/arm/tcg/translate-a64.c \
+            > ipa12-source-diff.patch
+          git diff --name-only "$base_commit" "$source_commit" \
+            > ipa12-source-files.txt
+          printf '%s\n' \
+            'qemu/target/arm/cpu.h' \
+            'qemu/target/arm/tcg/helper-a64-defs.h' \
+            'qemu/target/arm/tcg/helper-a64.c' \
+            'qemu/target/arm/tcg/psci.c' \
+            'qemu/target/arm/tcg/translate-a64.c' \
+            > ipa12-expected-source-files.txt
+          diff -u ipa12-expected-source-files.txt ipa12-source-files.txt
+
+          src=qemu/target/arm/tcg/translate-a64.c
+          helper=qemu/target/arm/tcg/helper-a64.c
+          psci=qemu/target/arm/tcg/psci.c
+          lib=qemu/build-ios/libqemu-aarch64-softmmu.dylib
+
+          grep -F '#define IPA11_BLRAA_SIGNATURE_WORDS 6' "$src"
+          grep -F '0xd73f0911' "$src"
+          grep -F 'IPA12_SYS55_SIG_TRANSLATED' "$src"
+          grep -F 'runtime_selector_filter=55' "$src"
+          grep -F 'IPA12_SYS55_ENTRY snapshot=%s record=%s' "$helper"
+          grep -F 'IPA12_SYS55_SNAPSHOT' "$helper"
+          grep -F 'IPA12_SYS55_FLUSH' "$helper"
+          grep -F 'IPA9_PE_SIGNATURE_WORDS 3' "$src"
+          grep -F 'IPA9_HALT_SIGNATURE_WORDS 12' "$src"
+          grep -F 'IPA10_RESTART_CALL_SIGNATURE_WORDS 4' "$src"
+          grep -F 'arm_ipa12_flush_sys55_events(env)' "$psci"
+          grep -F 'qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET)' "$psci"
+
+          scripts/build-ios.sh 2>&1 | tee ipa12-qemu-build.log
+          test -s "$lib"
+
+          strings "$lib" > ipa12-dylib-strings.txt
+          for marker in 'IPA12_READY observer=selector55_blraa' \
+                        'IPA12_SYS55_SIG_TRANSLATED' \
+                        'IPA12_SYS55_ENTRY snapshot=' \
+                        'IPA12_SYS55_SNAPSHOT' \
+                        'IPA12_SYS55_FLUSH' \
+                        'IPA11_BLRAA_ENTRY event=' \
+                        'IPA11_BLRAA_FLUSH reason=psci_system_reset' \
+                        'IPA11_BLRAA_SIG_TRANSLATED' \
+                        'IPA10_CALLER_ENTRY event=' \
+                        'IPA10_CALLER_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_SIG_TRANSLATED' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_FRAME ' 'MACPAD_RESET_CODE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa12-dylib-strings.txt
+          done
+
+          nm -a "$lib" > ipa12-dylib-symbols.txt
+          grep -E 'helper_ipa12_sys55_observer|arm_ipa12_snapshot_on_ipa10|arm_ipa12_flush_sys55_events' ipa12-dylib-symbols.txt
+          grep -E 'helper_ipa11_blraa_observer|arm_ipa11_flush_blraa_events' ipa12-dylib-symbols.txt
+          grep -E 'helper_ipa10_restart_callsite_observer|arm_ipa10_flush_restart_events' ipa12-dylib-symbols.txt
+          grep -E 'helper_ipa9_pe_entry_observer|helper_ipa9_halt_entry_observer|arm_ipa9_log_reset_summary' ipa12-dylib-symbols.txt
+
+          vtool -show-build-version "$lib" | tee ipa12-dylib-platform.txt
+          file "$lib" | tee ipa12-dylib-file.txt
+          lipo -archs "$lib" | tee ipa12-dylib-arches.txt
+          grep -Fx arm64 ipa12-dylib-arches.txt
+          shasum -a 256 "$lib" > ipa12-dylib.sha256
+          git rev-parse HEAD > ipa12-build-commit.txt
+          printf '%s\n' "$source_commit" > ipa12-source-commit.txt
+          printf '%s\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > ipa12-workflow-run.txt
+          cp qemu/build-ios.cross.txt ipa12-cross.txt
+          cp qemu/build-ios/compile_commands.json ipa12-compile-commands.json
+
+      - name: Build IPA and verify packaged QEMU
+        env:
+          ORCHARD_NO_ICON: "1"
+          ORCHARD_NO_NSIO: "1"
+        run: |
+          set -euo pipefail
+          ios/app/build.sh 2>&1 | tee ipa12-app-build.log
+
+          ipa=ios/app/IPA12.ipa
+          test -s ios/app/Orchard.ipa
+          test ! -e "$ipa"
+          mv ios/app/Orchard.ipa "$ipa"
+
+          unzip -t "$ipa" | tee ipa12-ipa-integrity.txt
+          mkdir ipa12-verify
+          unzip -q "$ipa" -d ipa12-verify
+          app=ipa12-verify/Payload/Orchard.app
+          bundled="$app/Frameworks/libqemu-aarch64-softmmu.dylib"
+          test -s "$app/Info.plist"
+          test -s "$app/Orchard"
+          test -s "$bundled"
+          plutil -extract CFBundleIdentifier raw -o - "$app/Info.plist" | tee ipa12-bundle-id.txt
+          grep -Fx 'com.makr.orchard' ipa12-bundle-id.txt
+
+          if cmp -s qemu/build-ios/libqemu-aarch64-softmmu.dylib "$bundled"; then
+            printf 'packaged dylib is byte-for-byte identical\n' > ipa12-package-compare.txt
+          else
+            printf 'packaged dylib differs bytewise; required markers checked below\n' > ipa12-package-compare.txt
+          fi
+
+          strings "$bundled" > ipa12-packaged-strings.txt
+          for marker in 'IPA12_READY observer=selector55_blraa' \
+                        'IPA12_SYS55_SIG_TRANSLATED' \
+                        'IPA12_SYS55_ENTRY snapshot=' \
+                        'IPA12_SYS55_SNAPSHOT' 'IPA12_SYS55_FLUSH' \
+                        'IPA11_BLRAA_ENTRY event=' \
+                        'IPA11_BLRAA_FLUSH reason=psci_system_reset' \
+                        'IPA10_CALLER_ENTRY event=' \
+                        'IPA10_CALLER_FLUSH reason=psci_system_reset' \
+                        'IPA9_PE_ENTRY event=' 'IPA9_HALT_ENTRY event=' \
+                        'IPA9_RESET_SUMMARY ' 'MACPAD_RESET_TRACE ' \
+                        'MACPAD_RESET_CAL '; do
+            grep -F "$marker" ipa12-packaged-strings.txt
+          done
+
+          file "$bundled" | tee ipa12-packaged-dylib-file.txt
+          lipo -archs "$bundled" | tee ipa12-packaged-dylib-arches.txt
+          grep -Fx arm64 ipa12-packaged-dylib-arches.txt
+          shasum -a 256 "$bundled" > ipa12-packaged-dylib.sha256
+          shasum -a 256 "$ipa" > ipa12-ipa.sha256
+          stat -f 'ipa_size_bytes=%z' "$ipa" > ipa12-ipa-size.txt
+          codesign -dv --verbose=4 "$app" 2> ipa12-codesign.txt
+          test -s "$ipa"
+
+      - name: Upload IPA12 artifact and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPA12
+          path: |
+            ios/app/IPA12.ipa
+            ipa12-*.log
+            ipa12-*.txt
+            ipa12-*.patch
+            ipa12-*.json
+            ipa12-*.sha256
+          if-no-files-found: error
