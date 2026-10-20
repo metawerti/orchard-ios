@@ -11345,7 +11345,7 @@ static void aarch64_ipa11_match_blraa(DisasContext *s, uint64_t pc,
                              " signature_start_pc=0x%016" PRIx64
                              " blraa_pc=0x%016" PRIx64,
                              translation, cpu->cpu_index,
-                             s->ipa11_blraa_pc, pc);
+                             (uint64_t)s->ipa11_blraa_pc, pc);
             }
         }
         s->ipa11_blraa_match = 0;
